@@ -13,7 +13,8 @@ import time
 import logging
 import threading
 from datetime import datetime
-from typing import Optional
+from flask import Flask, jsonify, Response, request
+from functools import wraps
 
 # Ensure data directories exist FIRST
 os.makedirs("data", exist_ok=True)
@@ -29,6 +30,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Global status for dashboard
+bot_status = {
+    "state": "starting",
+    "message": "Bot is initializing...",
+    "portfolio": 0,
+    "positions": []
+}
+
 
 def main():
     """Main entry point - runs the autonomous trading loop."""
@@ -37,18 +46,67 @@ def main():
     logger.info("AUTONOMOUS AI TRADING AGENT - STARTING")
     logger.info("=" * 60)
 
-    # ==================== START DASHBOARD IMMEDIATELY ====================
-    # This must happen FIRST so Railway sees the service as healthy
+    # ==================== START SIMPLE WEB SERVER IMMEDIATELY ====================
+    # Bare minimum Flask - no imports, no dependencies, just respond to Railway
 
-    from src.dashboard import run_dashboard, set_components
+    app = Flask(__name__)
 
-    dashboard_port = int(os.environ.get("PORT", 5000))
-    logger.info(f"Starting dashboard on port {dashboard_port}...")
-    run_dashboard(port=dashboard_port)
-    logger.info(f"Dashboard LIVE at http://0.0.0.0:{dashboard_port}")
+    def check_auth(username, password):
+        correct_user = os.environ.get("DASHBOARD_USER", "admin")
+        correct_pass = os.environ.get("DASHBOARD_PASS", "changeme")
+        return username == correct_user and password == correct_pass
 
-    # Give dashboard a moment to start
-    time.sleep(2)
+    def requires_auth(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            auth = request.authorization
+            if not auth or not check_auth(auth.username, auth.password):
+                return Response('Login required', 401, {'WWW-Authenticate': 'Basic realm="Bot"'})
+            return f(*args, **kwargs)
+        return decorated
+
+    @app.route("/")
+    @requires_auth
+    def home():
+        return f"""
+        <html>
+        <head><title>AI Trading Bot</title>
+        <meta http-equiv="refresh" content="10">
+        <style>
+            body {{ font-family: Arial; background: #111; color: #0f0; padding: 20px; }}
+            .status {{ font-size: 24px; margin: 20px 0; }}
+        </style>
+        </head>
+        <body>
+            <h1>AI Trading Bot</h1>
+            <div class="status">Status: {bot_status['state'].upper()}</div>
+            <p>{bot_status['message']}</p>
+            <p>Portfolio: ${bot_status['portfolio']:.2f}</p>
+            <p>Auto-refreshing every 10 seconds...</p>
+        </body>
+        </html>
+        """
+
+    @app.route("/health")
+    def health():
+        return "OK", 200
+
+    @app.route("/api/status")
+    @requires_auth
+    def api_status():
+        return jsonify(bot_status)
+
+    # Start Flask in background thread
+    port = int(os.environ.get("PORT", 5000))
+
+    def run_server():
+        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+
+    logger.info(f"Web server started on port {port}")
+    time.sleep(1)  # Give it a moment
 
     # ==================== INITIALIZE TRADING (can take time) ====================
 
