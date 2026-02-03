@@ -1,0 +1,21 @@
+# Railway Deployment Configuration
+# =================================
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Start command
+startCommand = "python -m src.main"
+
+# Always restart on crash (autonomous operation)
+restartPolicyType = "always"
+restartPolicyMaxRetries = 10
+
+# Health check
+healthcheckPath = "/"
+healthcheckTimeout = 30
+
+# Resource limits (free tier)
+numReplicas = 1

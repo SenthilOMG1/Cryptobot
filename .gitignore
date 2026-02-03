@@ -1,0 +1,28 @@
+# Environment files (contain secrets!)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# Data & Models (will be generated)
+data/*.db
+data/*.log
+models/*.json
+models/*.zip
+models/*.pkl
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
