@@ -1,118 +1,34 @@
 """
-Autonomous AI Trading Agent - Main Entry Point
-===============================================
-This is the heart of the system. It runs forever, trading autonomously.
-
-Usage:
-    python -m src.main
+Autonomous AI Trading Agent - Core Trading Logic
+=================================================
 """
 
 import os
 import sys
 import time
 import logging
-import threading
 from datetime import datetime
-from flask import Flask, jsonify, Response, request
-from functools import wraps
 
-# Ensure data directories exist FIRST
 os.makedirs("data", exist_ok=True)
 os.makedirs("models", exist_ok=True)
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
-# Global status for dashboard
-bot_status = {
-    "state": "starting",
-    "message": "Bot is initializing...",
-    "portfolio": 0,
-    "positions": []
-}
 
+def run_bot(status_dict):
+    """Run the trading bot. Updates status_dict for dashboard."""
 
-def main():
-    """Main entry point - runs the autonomous trading loop."""
-
-    logger.info("=" * 60)
-    logger.info("AUTONOMOUS AI TRADING AGENT - STARTING")
-    logger.info("=" * 60)
-
-    # ==================== START SIMPLE WEB SERVER IMMEDIATELY ====================
-    # Bare minimum Flask - no imports, no dependencies, just respond to Railway
-
-    app = Flask(__name__)
-
-    def check_auth(username, password):
-        correct_user = os.environ.get("DASHBOARD_USER", "admin")
-        correct_pass = os.environ.get("DASHBOARD_PASS", "changeme")
-        return username == correct_user and password == correct_pass
-
-    def requires_auth(f):
-        @wraps(f)
-        def decorated(*args, **kwargs):
-            auth = request.authorization
-            if not auth or not check_auth(auth.username, auth.password):
-                return Response('Login required', 401, {'WWW-Authenticate': 'Basic realm="Bot"'})
-            return f(*args, **kwargs)
-        return decorated
-
-    @app.route("/")
-    @requires_auth
-    def home():
-        return f"""
-        <html>
-        <head><title>AI Trading Bot</title>
-        <meta http-equiv="refresh" content="10">
-        <style>
-            body {{ font-family: Arial; background: #111; color: #0f0; padding: 20px; }}
-            .status {{ font-size: 24px; margin: 20px 0; }}
-        </style>
-        </head>
-        <body>
-            <h1>AI Trading Bot</h1>
-            <div class="status">Status: {bot_status['state'].upper()}</div>
-            <p>{bot_status['message']}</p>
-            <p>Portfolio: ${bot_status['portfolio']:.2f}</p>
-            <p>Auto-refreshing every 10 seconds...</p>
-        </body>
-        </html>
-        """
-
-    @app.route("/health")
-    def health():
-        return "OK", 200
-
-    @app.route("/api/status")
-    @requires_auth
-    def api_status():
-        return jsonify(bot_status)
-
-    # Start Flask in background thread
-    port = int(os.environ.get("PORT", 5000))
-
-    def run_server():
-        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-
-    server_thread = threading.Thread(target=run_server, daemon=True)
-    server_thread.start()
-
-    logger.info(f"Web server started on port {port}")
-    time.sleep(1)  # Give it a moment
-
-    # ==================== INITIALIZE TRADING (can take time) ====================
-
-    logger.info("Initializing trading components...")
+    logger.info("=" * 50)
+    logger.info("TRADING BOT STARTING")
+    logger.info("=" * 50)
 
     try:
+        # Import components
         from src.config import get_config
         from src.security.vault import SecureVault
         from src.trading.okx_client import SecureOKXClient
@@ -128,55 +44,41 @@ def main():
         from src.autonomous.retrainer import AutoRetrainer
         from src.autonomous.health import HealthMonitor
 
-        # Load configuration
         config = get_config()
-        logger.info(f"Configuration loaded")
+        logger.info("Config loaded")
 
-        # Initialize security vault
-        logger.info("Initializing secure vault...")
+        status_dict["state"] = "connecting"
+        status_dict["message"] = "Connecting to OKX..."
+
         vault = SecureVault()
-
-        # Initialize OKX client
-        logger.info("Connecting to OKX...")
         okx = SecureOKXClient(vault, demo_mode=config.exchange.demo_mode)
 
-        # Test connection
         if not okx.test_connection():
-            logger.error("Failed to connect to OKX! Check your API keys.")
-            logger.error("Bot will keep running - fix API keys and restart.")
-            # Don't exit - keep dashboard running
+            status_dict["state"] = "error"
+            status_dict["message"] = "Failed to connect to OKX - check API keys"
+            logger.error("OKX connection failed!")
             while True:
                 time.sleep(60)
 
-        logger.info("OKX connection successful!")
+        logger.info("OKX connected!")
+        status_dict["state"] = "initializing"
+        status_dict["message"] = "Loading ML models..."
 
-        # Initialize components
-        logger.info("Initializing trading components...")
-
-        # Data collection
         collector = DataCollector(okx)
         features = FeatureEngine()
-
-        # Position tracking
         positions = PositionTracker(okx)
         positions.sync_from_exchange()
 
-        # ML models
         xgb_model = XGBoostPredictor(model_path="models/xgboost_model.json")
         rl_agent = RLTradingAgent(model_path="models/rl_agent.zip")
 
-        # Check if models are trained
         if not xgb_model.is_trained or not rl_agent.is_trained:
-            logger.warning("ML models not found! Running initial training...")
+            status_dict["message"] = "Training ML models (first run)..."
+            logger.info("Training models...")
             initial_training(collector, features, xgb_model, rl_agent, config.trading.trading_pairs)
 
-        # Ensemble decider
-        ensemble = EnsembleDecider(
-            xgb_model, rl_agent,
-            min_confidence=config.trading.min_confidence_to_trade
-        )
+        ensemble = EnsembleDecider(xgb_model, rl_agent, min_confidence=config.trading.min_confidence_to_trade)
 
-        # Risk management
         risk_limits = RiskLimits(
             max_position_pct=config.trading.max_position_percent,
             stop_loss_pct=config.trading.stop_loss_percent,
@@ -186,192 +88,114 @@ def main():
             min_confidence=config.trading.min_confidence_to_trade
         )
         risk = RiskManager(positions, risk_limits)
-
-        # Trade executor
         executor = TradeExecutor(okx, risk)
-
-        # Autonomous systems
         watchdog = Watchdog(max_retries=10, retry_delay=60)
         retrainer = AutoRetrainer(collector, features, xgb_model, rl_agent)
         health = HealthMonitor()
 
-        # Register components for health monitoring
-        health.register_component("okx_connection", True)
-        health.register_component("xgb_model", xgb_model.is_trained)
-        health.register_component("rl_agent", rl_agent.is_trained)
+        logger.info("All components ready!")
+        status_dict["state"] = "running"
+        status_dict["message"] = "Trading actively"
 
-        logger.info("All components initialized successfully!")
-
-        # Update dashboard with component references
-        set_components({
-            "positions": positions,
-            "risk": risk,
-            "health": health,
-            "executor": executor
-        })
-
-        # ==================== MAIN TRADING LOOP ====================
-
-        logger.info("Starting autonomous trading loop...")
-        logger.info(f"Trading pairs: {config.trading.trading_pairs}")
-        logger.info(f"Analysis interval: {config.trading.analysis_interval_minutes} minutes")
-
-        cycle_count = 0
-
+        # Main loop
+        cycle = 0
         while True:
             try:
-                cycle_count += 1
-                cycle_start = datetime.now()
+                cycle += 1
+                logger.info(f"\n=== CYCLE {cycle} ===")
 
-                logger.info(f"\n{'='*50}")
-                logger.info(f"CYCLE #{cycle_count} - {cycle_start.strftime('%Y-%m-%d %H:%M:%S')}")
-                logger.info(f"{'='*50}")
+                # Update portfolio
+                positions.update_prices()
+                portfolio = positions.get_portfolio_summary()
+                status_dict["portfolio"] = portfolio.get("total_value", 0)
+                logger.info(f"Portfolio: ${portfolio['total_value']:.2f}")
 
-                # Health Check
-                health_status = health.check_system_health()
-                if not health_status["is_healthy"]:
-                    logger.warning(f"System unhealthy: {health_status}")
-
-                # Check if trading should pause
+                # Check risk
                 if risk.should_pause_trading():
-                    logger.warning("Trading paused by risk manager. Waiting...")
+                    status_dict["message"] = "Trading paused (risk limit)"
                     time.sleep(3600)
                     continue
 
-                # Update positions
-                positions.update_prices()
-                portfolio = positions.get_portfolio_summary()
-                logger.info(f"Portfolio: ${portfolio['total_value']:.2f} USDT")
-                logger.info(f"Open positions: {portfolio['num_positions']}")
-
-                # Check existing positions
-                for position in positions.get_all_positions():
-                    pair = position.pair
-                    logger.info(
-                        f"  {pair}: ${position.current_price:.2f} | "
-                        f"P&L: {position.unrealized_pnl_pct:+.2f}%"
-                    )
-
-                    if risk.check_stop_loss(position):
-                        logger.warning(f"STOP-LOSS triggered for {pair}")
-                        result = executor.close_position(pair, position.entry_price)
+                # Check positions for stop-loss/take-profit
+                for pos in positions.get_all_positions():
+                    if risk.check_stop_loss(pos):
+                        logger.warning(f"STOP-LOSS: {pos.pair}")
+                        result = executor.close_position(pos.pair, pos.entry_price)
                         if result.success:
-                            positions.remove_position(pair)
-                            risk.record_trade()
-                        continue
-
-                    if risk.check_take_profit(position):
-                        logger.info(f"TAKE-PROFIT triggered for {pair}")
-                        result = executor.close_position(pair, position.entry_price)
+                            positions.remove_position(pos.pair)
+                    elif risk.check_take_profit(pos):
+                        logger.info(f"TAKE-PROFIT: {pos.pair}")
+                        result = executor.close_position(pos.pair, pos.entry_price)
                         if result.success:
-                            positions.remove_position(pair)
-                            risk.record_trade()
-                        continue
+                            positions.remove_position(pos.pair)
 
-                # Analyze each trading pair
+                # Analyze pairs
                 for pair in config.trading.trading_pairs:
                     try:
-                        logger.info(f"\nAnalyzing {pair}...")
-
                         if positions.has_position(pair):
-                            logger.debug(f"Already have position in {pair}, skipping")
                             continue
 
                         candles = collector.get_candles(pair, "1h", 100)
                         if len(candles) < 50:
-                            logger.warning(f"Not enough data for {pair}")
                             continue
 
                         df_features = features.calculate_features(candles)
                         if df_features.empty:
-                            logger.warning(f"Feature calculation failed for {pair}")
                             continue
 
-                        latest_features = df_features.iloc[[-1]]
-                        current_price = float(candles["close"].iloc[-1])
+                        latest = df_features.iloc[[-1]]
+                        price = float(candles["close"].iloc[-1])
 
                         portfolio_state = {
                             "balance": okx.get_usdt_balance(),
                             "position": 0,
                             "entry_price": 0,
-                            "current_price": current_price
+                            "current_price": price
                         }
 
-                        decision = ensemble.get_decision(
-                            latest_features,
-                            portfolio_state,
-                            pair
-                        )
+                        decision = ensemble.get_decision(latest, portfolio_state, pair)
 
-                        executor.record_decision(decision, executed=False)
-
-                        if decision.action != Action.HOLD:
-                            if decision.action == Action.BUY:
-                                logger.info(f"BUY signal for {pair} (confidence: {decision.confidence:.2f})")
-                                result = executor.execute(decision, current_price)
-
-                                if result.success:
-                                    positions.add_position(pair, result.amount, result.price)
-                                    risk.record_trade()
-                                    logger.info(f"Bought {result.amount} {pair} at ${result.price}")
-
-                            elif decision.action == Action.SELL:
-                                logger.debug(f"SELL signal for {pair} but no position")
+                        if decision.action == Action.BUY:
+                            logger.info(f"BUY {pair} (conf: {decision.confidence:.2f})")
+                            result = executor.execute(decision, price)
+                            if result.success:
+                                positions.add_position(pair, result.amount, result.price)
+                                logger.info(f"Bought {result.amount} {pair} @ ${result.price}")
 
                     except Exception as e:
-                        logger.error(f"Error analyzing {pair}: {e}")
-                        health.record_error()
-                        continue
+                        logger.error(f"Error on {pair}: {e}")
 
-                # Auto-retrain if needed
+                # Auto-retrain check
                 if retrainer.should_retrain():
-                    logger.info("Scheduled model retraining...")
-                    try:
-                        retrainer.retrain_models(config.trading.trading_pairs)
-                    except Exception as e:
-                        logger.error(f"Retraining failed: {e}")
+                    status_dict["message"] = "Retraining models..."
+                    retrainer.retrain_models(config.trading.trading_pairs)
+                    status_dict["message"] = "Trading actively"
 
-                # Cycle complete
-                cycle_duration = (datetime.now() - cycle_start).total_seconds()
-                logger.info(f"\nCycle #{cycle_count} complete in {cycle_duration:.1f}s")
-                logger.info(health.get_summary())
-
-                wait_minutes = config.trading.analysis_interval_minutes
-                logger.info(f"Waiting {wait_minutes} minutes until next cycle...")
-                time.sleep(wait_minutes * 60)
-
-            except KeyboardInterrupt:
-                logger.info("\nShutdown requested. Exiting gracefully...")
-                break
+                status_dict["message"] = f"Cycle {cycle} done. Next in {config.trading.analysis_interval_minutes}min"
+                time.sleep(config.trading.analysis_interval_minutes * 60)
 
             except Exception as e:
-                logger.error(f"Error in main loop: {e}")
-                health.record_error()
-
+                logger.error(f"Loop error: {e}")
                 if not watchdog._on_error(e):
-                    logger.critical("Max retries exceeded. Shutting down.")
                     break
 
     except Exception as e:
-        logger.error(f"Initialization error: {e}")
-        logger.error("Dashboard still running - check logs and fix the issue.")
-        # Keep running so Railway doesn't restart endlessly
+        logger.error(f"Fatal error: {e}")
+        status_dict["state"] = "error"
+        status_dict["message"] = str(e)
         while True:
             time.sleep(60)
 
-    logger.info("Autonomous trading agent stopped.")
-
 
 def initial_training(collector, features, xgb_model, rl_agent, trading_pairs):
-    """Perform initial model training if models don't exist."""
+    """Train models on historical data."""
     import pandas as pd
     from src.data.features import create_target_labels
 
-    logger.info("Performing initial model training...")
-
+    logger.info("Collecting training data...")
     all_data = []
+
     for pair in trading_pairs:
-        logger.info(f"Collecting historical data for {pair}...")
         try:
             df = collector.get_historical_data(pair, days=60, timeframe="1h")
             df_features = features.calculate_features(df)
@@ -379,28 +203,25 @@ def initial_training(collector, features, xgb_model, rl_agent, trading_pairs):
             df_features["pair"] = pair
             all_data.append(df_features)
         except Exception as e:
-            logger.error(f"Failed to collect data for {pair}: {e}")
+            logger.error(f"Data collection failed for {pair}: {e}")
 
     if not all_data:
-        raise ValueError("No training data available!")
+        raise ValueError("No training data!")
 
-    combined_df = pd.concat(all_data, ignore_index=True)
-    combined_df = combined_df.dropna()
-
-    logger.info(f"Training on {len(combined_df)} samples...")
+    combined = pd.concat(all_data, ignore_index=True).dropna()
+    logger.info(f"Training on {len(combined)} samples")
 
     feature_cols = features.get_feature_names()
-    X = combined_df[feature_cols]
-    y = combined_df["target"]
+    X = combined[feature_cols]
+    y = combined["target"]
 
-    logger.info("Training XGBoost model...")
     xgb_model.train(X, y)
+    rl_agent.train(combined, feature_cols, total_timesteps=50000)
 
-    logger.info("Training RL agent...")
-    rl_agent.train(combined_df, feature_cols, total_timesteps=50000)
-
-    logger.info("Initial training complete!")
+    logger.info("Training complete!")
 
 
 if __name__ == "__main__":
-    main()
+    # For direct running (not via app.py)
+    status = {"state": "starting", "message": "", "portfolio": 0}
+    run_bot(status)
