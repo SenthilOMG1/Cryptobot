@@ -3,7 +3,9 @@ python-okx>=0.3.0          # OKX exchange API
 pandas>=2.0.0              # Data manipulation
 numpy>=1.24.0              # Numerical computing
 
-# Machine Learning
+# Machine Learning (CPU-only for faster builds)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.1.0+cpu           # PyTorch CPU-only (much smaller!)
 xgboost>=2.0.0             # Gradient boosting for price prediction
 stable-baselines3>=2.2.0   # Reinforcement learning (PPO)
 gymnasium>=0.29.0          # RL environments
