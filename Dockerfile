@@ -31,9 +31,5 @@ USER trader
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Health check
-HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-    CMD python -c "import requests; requests.get('https://www.okx.com')" || exit 1
-
 # Run the trading bot
 CMD ["python", "-m", "src.main"]
