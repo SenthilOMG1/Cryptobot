@@ -51,7 +51,7 @@ class AutoRetrainer:
         self.retrain_interval = timedelta(days=retrain_interval_days)
         self.min_improvement = min_improvement
 
-        self.last_retrain: Optional[datetime] = None
+        self.last_retrain: Optional[datetime] = datetime.now()  # Don't retrain on first boot
         self.retrain_history: list = []
 
     def should_retrain(self) -> bool:
@@ -146,7 +146,7 @@ class AutoRetrainer:
                 rl_metrics = self.rl_agent.train(
                     combined_df,
                     feature_cols,
-                    total_timesteps=50000
+                    total_timesteps=200000
                 )
                 results["rl_result"] = rl_metrics
                 self.rl_agent.save_model()

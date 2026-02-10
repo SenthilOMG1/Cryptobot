@@ -314,7 +314,7 @@ class FeatureEngine:
         ]
 
 
-def create_target_labels(df: pd.DataFrame, lookahead: int = 1, threshold: float = 0.02) -> pd.Series:
+def create_target_labels(df: pd.DataFrame, lookahead: int = 4, threshold: float = 0.005) -> pd.Series:
     """
     Create target labels for ML training.
 
@@ -325,8 +325,8 @@ def create_target_labels(df: pd.DataFrame, lookahead: int = 1, threshold: float 
 
     Args:
         df: DataFrame with 'close' column
-        lookahead: How many periods ahead to look
-        threshold: Minimum price change to trigger signal (0.02 = 2%)
+        lookahead: How many periods ahead to look (4 = 4 hours for 1H candles)
+        threshold: Minimum price change to trigger signal (0.005 = 0.5%)
 
     Returns:
         Series with labels

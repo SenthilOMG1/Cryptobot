@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class Position:
     """Represents an open trading position."""
     pair: str
-    side: str  # "long" for bought crypto
+    side: str  # "long" for bought crypto, "short" for futures short
     amount: float
     entry_price: float
     entry_time: datetime
@@ -25,12 +25,20 @@ class Position:
     unrealized_pnl_pct: float = 0.0
     highest_price: float = 0.0
     lowest_price: float = 0.0
+    mode: str = "spot"  # "spot" or "futures"
 
     def update_price(self, price: float):
-        """Update position with current price."""
+        """Update position with current price. Direction-aware P&L."""
         self.current_price = price
-        self.unrealized_pnl = (price - self.entry_price) * self.amount
-        self.unrealized_pnl_pct = ((price - self.entry_price) / self.entry_price) * 100
+
+        if self.side == "short":
+            # Shorts profit when price goes DOWN
+            self.unrealized_pnl = (self.entry_price - price) * self.amount
+            self.unrealized_pnl_pct = ((self.entry_price - price) / self.entry_price) * 100
+        else:
+            # Longs profit when price goes UP
+            self.unrealized_pnl = (price - self.entry_price) * self.amount
+            self.unrealized_pnl_pct = ((price - self.entry_price) / self.entry_price) * 100
 
         # Track highest/lowest for trailing stops
         if price > self.highest_price:
@@ -104,36 +112,86 @@ class PositionTracker:
         except Exception as e:
             logger.error(f"Failed to sync positions: {e}")
 
+    def sync_futures_from_exchange(self, futures_pairs: list):
+        """
+        Sync open futures positions from OKX on startup.
+
+        Args:
+            futures_pairs: List of spot pair names enabled for futures
+        """
+        try:
+            positions_data = self.okx.get_futures_positions()
+            for pos in positions_data:
+                inst_id = pos.get("instId", "")  # e.g. "SOL-USDT-SWAP"
+                pos_amt = float(pos.get("pos", 0))
+                if pos_amt == 0:
+                    continue
+
+                # Convert SWAP instrument back to spot pair name
+                pair = inst_id.replace("-SWAP", "")
+                if pair not in futures_pairs:
+                    continue
+
+                avg_price = float(pos.get("avgPx", 0))
+                side = "long" if pos_amt > 0 else "short"
+                amount = abs(pos_amt)
+
+                key = f"{pair}:futures"
+                if key not in self.positions:
+                    mark_price = float(pos.get("markPx", avg_price))
+                    self.positions[key] = Position(
+                        pair=pair,
+                        side=side,
+                        amount=amount,
+                        entry_price=avg_price,
+                        entry_time=datetime.now(),
+                        current_price=mark_price,
+                        highest_price=mark_price,
+                        lowest_price=mark_price,
+                        mode="futures"
+                    )
+                    logger.info(f"Recovered futures position: {pair} {side} x{amount} @ ${avg_price}")
+
+        except Exception as e:
+            logger.error(f"Failed to sync futures positions: {e}")
+
     def add_position(
         self,
         pair: str,
         amount: float,
-        entry_price: float
+        entry_price: float,
+        side: str = "long",
+        mode: str = "spot"
     ) -> Position:
         """
-        Add a new position after a buy.
+        Add a new position.
 
         Args:
             pair: Trading pair
-            amount: Amount of crypto bought
+            amount: Amount of crypto (or contracts for futures)
             entry_price: Entry price
+            side: "long" or "short"
+            mode: "spot" or "futures"
 
         Returns:
             Position object
         """
         position = Position(
             pair=pair,
-            side="long",
+            side=side,
             amount=amount,
             entry_price=entry_price,
             entry_time=datetime.now(),
             current_price=entry_price,
             highest_price=entry_price,
-            lowest_price=entry_price
+            lowest_price=entry_price,
+            mode=mode
         )
 
-        self.positions[pair] = position
-        logger.info(f"Position opened: {pair}, amount: {amount}, entry: ${entry_price}")
+        # Use different key for futures to allow both spot and futures on same pair
+        key = f"{pair}:futures" if mode == "futures" else pair
+        self.positions[key] = position
+        logger.info(f"Position opened: {pair} ({mode} {side}), amount: {amount}, entry: ${entry_price}")
 
         return position
 
@@ -155,21 +213,43 @@ class PositionTracker:
 
     def update_prices(self):
         """Update all positions with current prices."""
-        for pair, position in self.positions.items():
+        for key, position in self.positions.items():
             try:
-                ticker = self.okx.get_ticker(pair)
+                # For futures positions, fetch swap ticker; for spot, use spot ticker
+                if position.mode == "futures":
+                    swap_id = self.okx.spot_to_swap(position.pair)
+                    ticker = self.okx.get_ticker(swap_id)
+                else:
+                    ticker = self.okx.get_ticker(position.pair)
                 current_price = float(ticker.get("last", 0))
                 position.update_price(current_price)
             except Exception as e:
-                logger.error(f"Failed to update price for {pair}: {e}")
+                logger.error(f"Failed to update price for {key}: {e}")
 
-    def get_position(self, pair: str) -> Optional[Position]:
+    def get_position(self, pair: str, mode: str = "spot") -> Optional[Position]:
         """Get a specific position."""
-        return self.positions.get(pair)
+        key = f"{pair}:futures" if mode == "futures" else pair
+        return self.positions.get(key)
 
-    def has_position(self, pair: str) -> bool:
-        """Check if we have a position in this pair."""
-        return pair in self.positions
+    def has_position(self, pair: str, mode: str = None) -> bool:
+        """Check if we have a position in this pair.
+        If mode is None, checks both spot and futures."""
+        if mode is None:
+            return pair in self.positions or f"{pair}:futures" in self.positions
+        key = f"{pair}:futures" if mode == "futures" else pair
+        return key in self.positions
+
+    def remove_futures_position(self, pair: str) -> Optional[Position]:
+        """Remove a futures position after closing."""
+        key = f"{pair}:futures"
+        if key in self.positions:
+            position = self.positions.pop(key)
+            logger.info(
+                f"Futures position closed: {pair}, P&L: ${position.unrealized_pnl:.2f} "
+                f"({position.unrealized_pnl_pct:.2f}%)"
+            )
+            return position
+        return None
 
     def get_all_positions(self) -> List[Position]:
         """Get all open positions."""
@@ -207,6 +287,8 @@ class PositionTracker:
             "positions": [
                 {
                     "pair": p.pair,
+                    "side": p.side,
+                    "mode": p.mode,
                     "amount": p.amount,
                     "entry_price": p.entry_price,
                     "current_price": p.current_price,

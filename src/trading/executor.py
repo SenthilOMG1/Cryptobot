@@ -408,6 +408,161 @@ class TradeExecutor:
             error="Failed to close position"
         )
 
+    def execute_short_open(self, decision, current_price: float, futures_config) -> TradeResult:
+        """
+        Open a short position via perpetual swap.
+
+        Args:
+            decision: TradeDecision from ensemble (action == SELL)
+            current_price: Current price of the asset
+            futures_config: FuturesConfig with leverage/margin settings
+        """
+        pair = decision.pair
+
+        # Validate with risk manager
+        if not self.risk.validate_trade(decision):
+            return TradeResult(
+                success=False, order_id="", pair=pair, side="short_open",
+                amount=0, price=0, total_value=0, fee=0,
+                error="Trade rejected by risk manager"
+            )
+
+        try:
+            # Get available USDT balance
+            usdt_balance = self.okx.get_usdt_balance()
+
+            # Calculate trade size (same logic as buy)
+            trade_size_pct = decision.suggested_size_pct / 100
+            trade_amount_usdt = usdt_balance * trade_size_pct
+
+            # Get swap instrument info for contract sizing
+            swap_info = self.okx.get_swap_instrument_info(pair)
+            ct_val = float(swap_info.get("ctVal", 1))  # Contract value (e.g. 1 SOL per contract)
+            min_sz = float(swap_info.get("minSz", 1))  # Minimum contracts
+
+            # Calculate number of contracts
+            # With leverage, our margin buys more exposure
+            effective_usdt = trade_amount_usdt * futures_config.leverage
+            num_contracts = int(effective_usdt / (ct_val * current_price))
+
+            if num_contracts < min_sz:
+                return TradeResult(
+                    success=False, order_id="", pair=pair, side="short_open",
+                    amount=0, price=current_price, total_value=trade_amount_usdt, fee=0,
+                    error=f"Calculated {num_contracts} contracts, minimum is {min_sz}"
+                )
+
+            logger.info(
+                f"Opening SHORT: {pair}, {num_contracts} contracts "
+                f"(${trade_amount_usdt:.2f} margin, {futures_config.leverage}x leverage)"
+            )
+
+            # Place sell order on swap to open short
+            result = self.okx.place_futures_order(
+                pair=pair,
+                side="sell",
+                size=str(num_contracts),
+                margin_mode=futures_config.margin_mode
+            )
+
+            if result and result.get("ordId"):
+                order_id = result["ordId"]
+
+                import time
+                time.sleep(0.5)
+                swap_id = self.okx.spot_to_swap(pair)
+                order_info = self.okx.get_order(swap_id, order_id)
+
+                fill_price = float(order_info.get("avgPx", current_price))
+                fill_sz = float(order_info.get("accFillSz", num_contracts))
+                fee = float(order_info.get("fee", 0))
+
+                # Amount in base currency terms
+                amount_base = fill_sz * ct_val
+
+                trade_result = TradeResult(
+                    success=True,
+                    order_id=order_id,
+                    pair=pair,
+                    side="short_open",
+                    amount=amount_base,
+                    price=fill_price,
+                    total_value=amount_base * fill_price,
+                    fee=abs(fee)
+                )
+
+                self._record_trade(trade_result, decision)
+                return trade_result
+
+            return TradeResult(
+                success=False, order_id="", pair=pair, side="short_open",
+                amount=0, price=current_price, total_value=0, fee=0,
+                error="Futures order placement failed"
+            )
+
+        except Exception as e:
+            logger.error(f"Short open failed: {e}")
+            return TradeResult(
+                success=False, order_id="", pair=pair, side="short_open",
+                amount=0, price=current_price, total_value=0, fee=0,
+                error=str(e)
+            )
+
+    def close_futures_position(self, pair: str, entry_price: float = 0, margin_mode: str = "cross") -> TradeResult:
+        """
+        Close a futures/short position.
+
+        Args:
+            pair: Trading pair (e.g. 'SOL-USDT')
+            entry_price: Original entry price for P&L
+            margin_mode: 'cross' or 'isolated'
+        """
+        try:
+            swap_id = self.okx.spot_to_swap(pair)
+            current_price = float(self.okx.get_ticker(swap_id).get("last", 0))
+
+            logger.info(f"Closing futures position: {pair}")
+            result = self.okx.close_futures_position(pair, margin_mode)
+
+            if result:
+                # Calculate P&L (for shorts: profit = entry - exit)
+                pnl = 0
+                pnl_pct = 0
+                if entry_price > 0:
+                    # We don't know direction here, but the position tracker does
+                    # Use entry > current as short indicator
+                    pnl = (entry_price - current_price)  # Approximate per-unit
+                    pnl_pct = (pnl / entry_price) * 100
+
+                trade_result = TradeResult(
+                    success=True,
+                    order_id=result[0].get("ordId", "") if isinstance(result, list) and result else "",
+                    pair=pair,
+                    side="short_close",
+                    amount=0,  # OKX close_positions closes all
+                    price=current_price,
+                    total_value=0,
+                    fee=0
+                )
+
+                self._record_trade(trade_result, pnl=pnl, pnl_pct=pnl_pct, entry_price=entry_price)
+                logger.info(f"Futures position closed: {pair}, P&L: ~{pnl_pct:.2f}%")
+                return trade_result
+
+            return TradeResult(
+                success=False, order_id="", pair=pair, side="short_close",
+                amount=0, price=current_price, total_value=0, fee=0,
+                error="Failed to close futures position"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to close futures position {pair}: {e}")
+            return TradeResult(
+                success=False, order_id="", pair=pair, side="short_close",
+                amount=0, price=0, total_value=0, fee=0,
+                error=str(e)
+            )
+
     def _record_trade(
         self,
         result: TradeResult,

@@ -55,6 +55,11 @@ class TradingEnvironment(gym.Env):
         self.transaction_fee = transaction_fee
         self.max_position_pct = max_position_pct
 
+        # Precompute target labels for reward alignment
+        self.has_targets = 'target' in df.columns
+        if self.has_targets:
+            self.targets = df['target'].values
+
         # State space: features + [balance_ratio, position_ratio, unrealized_pnl]
         n_features = len(feature_columns) + 3
         self.observation_space = spaces.Box(
@@ -137,11 +142,18 @@ class TradingEnvironment(gym.Env):
         # Move to next step
         self.current_step += 1
 
+        # Reward alignment with target labels (same signals XGBoost trains on)
+        if self.has_targets and self.current_step < len(self.targets):
+            target = self.targets[self.current_step - 1]
+            # action: 0=HOLD, 1=BUY, 2=SELL; target: 0=HOLD, 1=BUY, -1=SELL
+            action_map = {0: 0, 1: 1, 2: -1}  # map RL actions to target labels
+            rl_signal = action_map[int(action)]
+            if rl_signal == target and target != 0:
+                reward += 0.2  # Small bonus for agreeing with direction signal
+
         # Calculate unrealized P&L for holding positions
         if self.position > 0:
             unrealized_pnl = (current_price - self.entry_price) / self.entry_price
-            # Small negative reward for holding (encourages action)
-            reward -= 0.01
 
             # Penalize large drawdowns
             if unrealized_pnl < -0.05:  # Down more than 5%
@@ -236,6 +248,7 @@ class RLTradingAgent:
             "gamma": 0.99,
             "gae_lambda": 0.95,
             "clip_range": 0.2,
+            "ent_coef": 0.05,  # Entropy bonus - prevents policy collapse to single action
             "verbose": 0,
         }
 
@@ -288,11 +301,11 @@ class RLTradingAgent:
 
         self.is_trained = True
 
+        # Save model first (so it persists even if evaluation fails)
+        self.save_model()
+
         # Evaluate
         metrics = self._evaluate_training(df, feature_columns, initial_balance)
-
-        # Save model
-        self.save_model()
 
         logger.info(f"RL training complete - Final Return: {metrics['total_return']:.2%}")
 
@@ -369,16 +382,17 @@ class RLTradingAgent:
         # Get action and value from model
         action, _ = self.model.predict(observation, deterministic=True)
 
-        # Get action probabilities for confidence
-        # PPO doesn't directly expose probabilities, so we estimate confidence
-        # based on the value function
+        # Get action probabilities for confidence using policy distribution
         try:
-            values = self.model.policy.predict_values(
-                self.model.policy.obs_to_tensor(observation.reshape(1, -1))[0]
-            )
-            # Normalize value to confidence (sigmoid-like)
-            confidence = float(1 / (1 + np.exp(-values.cpu().numpy()[0] / 10)))
-        except:
+            import torch
+            obs_tensor = torch.as_tensor(observation.reshape(1, -1), dtype=torch.float32)
+            obs_tensor = obs_tensor.to(self.model.policy.device)
+            with torch.no_grad():
+                dist = self.model.policy.get_distribution(obs_tensor)
+                probs = dist.distribution.probs.cpu().numpy()[0]
+                confidence = float(probs[int(action)])
+        except Exception as e:
+            logger.debug(f"RL confidence fallback: {e}")
             confidence = 0.6  # Default confidence
 
         # Convert action: 0=HOLD, 1=BUY, 2=SELL -> 0=HOLD, 1=BUY, -1=SELL

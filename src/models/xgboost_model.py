@@ -48,15 +48,20 @@ class XGBoostPredictor:
 
         # Default hyperparameters (optimized for trading)
         self.params = {
-            "n_estimators": 100,
-            "max_depth": 6,
-            "learning_rate": 0.1,
+            "n_estimators": 150,
+            "max_depth": 4,
+            "learning_rate": 0.05,
             "objective": "multi:softprob",
             "num_class": 3,  # UP, DOWN, HOLD
             "eval_metric": "mlogloss",
             "use_label_encoder": False,
             "random_state": 42,
             "n_jobs": -1,  # Use all CPU cores
+            "min_child_weight": 3,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "reg_alpha": 0.1,
+            "reg_lambda": 1.0,
         }
 
         # Try to load existing model
@@ -97,12 +102,21 @@ class XGBoostPredictor:
 
         logger.info(f"Train size: {len(X_train)}, Validation size: {len(X_val)}")
 
+        # Calculate class weights to handle imbalanced data
+        from collections import Counter
+        counts = Counter(y_train.values)
+        total = len(y_train)
+        n_classes = len(counts)
+        class_weights = {cls: total / (n_classes * count) for cls, count in counts.items()}
+        sample_weights = y_train.map(class_weights).values
+
         # Create model
         self.model = xgb.XGBClassifier(**self.params)
 
-        # Train with early stopping
+        # Train with class balancing (no early stopping - let it use all rounds)
         self.model.fit(
             X_train, y_train,
+            sample_weight=sample_weights,
             eval_set=[(X_val, y_val)],
             verbose=False
         )

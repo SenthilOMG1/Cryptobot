@@ -49,6 +49,7 @@ class SecureOKXClient:
             import okx.MarketData as MarketData
             import okx.Trade as Trade
             import okx.Account as Account
+            import okx.PublicData as PublicData
 
             # Load decrypted API keys
             keys = self.vault.load_api_keys()
@@ -58,6 +59,7 @@ class SecureOKXClient:
 
             # Initialize API clients
             self._market_api = MarketData.MarketAPI(flag=flag)
+            self._public_api = PublicData.PublicAPI(flag=flag)
 
             self._trade_api = Trade.TradeAPI(
                 api_key=keys["api_key"],
@@ -220,7 +222,7 @@ class SecureOKXClient:
             Dict with minSz, lotSz, tickSz, etc.
         """
         self._rate_limit()
-        response = self._market_api.get_instruments(instType="SPOT", instId=inst_id)
+        response = self._public_api.get_instruments(instType="SPOT", instId=inst_id)
         data = self._handle_response(response, "get_instrument_info")
         return data[0] if data else {}
 
@@ -337,6 +339,125 @@ class SecureOKXClient:
 
         response = self._trade_api.get_orders_history(**params)
         return self._handle_response(response, "get_order_history")
+
+    # ==================== Futures/Swap ====================
+
+    @staticmethod
+    def spot_to_swap(pair: str) -> str:
+        """Convert spot pair to swap instrument ID. e.g. 'SOL-USDT' -> 'SOL-USDT-SWAP'"""
+        return f"{pair}-SWAP"
+
+    def get_swap_instrument_info(self, pair: str) -> Dict[str, Any]:
+        """Get swap instrument info (contract size, min size, etc.)."""
+        self._rate_limit()
+        swap_id = self.spot_to_swap(pair)
+        response = self._public_api.get_instruments(instType="SWAP", instId=swap_id)
+        data = self._handle_response(response, "get_swap_instrument_info")
+        return data[0] if data else {}
+
+    def set_position_mode(self, mode: str = "net_mode") -> Dict[str, Any]:
+        """
+        Set account position mode.
+
+        Args:
+            mode: 'long_short_mode' or 'net_mode'
+        """
+        self._rate_limit()
+        response = self._account_api.set_position_mode(posMode=mode)
+        return self._handle_response(response, "set_position_mode")
+
+    def set_leverage(self, pair: str, leverage: int, margin_mode: str = "cross") -> Dict[str, Any]:
+        """
+        Set leverage for a swap instrument.
+
+        Args:
+            pair: Spot pair name (e.g. 'SOL-USDT'), will be converted to swap
+            leverage: Leverage multiplier (1-3)
+            margin_mode: 'cross' or 'isolated'
+        """
+        self._rate_limit()
+        swap_id = self.spot_to_swap(pair)
+        response = self._account_api.set_leverage(
+            instId=swap_id,
+            lever=str(leverage),
+            mgnMode=margin_mode
+        )
+        return self._handle_response(response, "set_leverage")
+
+    def place_futures_order(
+        self,
+        pair: str,
+        side: str,
+        size: str,
+        margin_mode: str = "cross",
+        client_order_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Place a futures/swap market order.
+
+        Args:
+            pair: Spot pair name (e.g. 'SOL-USDT'), converted to SWAP
+            side: 'buy' (open long) or 'sell' (open short)
+            size: Number of contracts (string)
+            margin_mode: 'cross' or 'isolated'
+            client_order_id: Optional custom order ID
+        """
+        self._rate_limit()
+        swap_id = self.spot_to_swap(pair)
+
+        params = {
+            "instId": swap_id,
+            "tdMode": margin_mode,
+            "side": side,
+            "ordType": "market",
+            "sz": size,
+        }
+
+        if client_order_id:
+            params["clOrdId"] = client_order_id
+
+        logger.info(f"Placing futures {side.upper()}: {swap_id}, {size} contracts, {margin_mode}")
+        response = self._trade_api.place_order(**params)
+        result = self._handle_response(response, "place_futures_order")
+
+        if result:
+            order_id = result[0].get("ordId", "")
+            logger.info(f"Futures order placed: {order_id}")
+
+        return result[0] if result else {}
+
+    def close_futures_position(self, pair: str, margin_mode: str = "cross") -> Dict[str, Any]:
+        """
+        Close an entire futures position using OKX close_positions endpoint.
+
+        Args:
+            pair: Spot pair name (e.g. 'SOL-USDT')
+            margin_mode: 'cross' or 'isolated'
+        """
+        self._rate_limit()
+        swap_id = self.spot_to_swap(pair)
+
+        logger.info(f"Closing futures position: {swap_id}")
+        response = self._trade_api.close_positions(
+            instId=swap_id,
+            mgnMode=margin_mode
+        )
+        return self._handle_response(response, "close_futures_position")
+
+    def get_futures_positions(self, pair: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Get open futures/swap positions.
+
+        Args:
+            pair: Optional spot pair to filter (e.g. 'SOL-USDT')
+        """
+        self._rate_limit()
+        params = {"instType": "SWAP"}
+        if pair:
+            params["instId"] = self.spot_to_swap(pair)
+
+        response = self._account_api.get_positions(**params)
+        return self._handle_response(response, "get_futures_positions")
 
     # ==================== Utility ====================
 

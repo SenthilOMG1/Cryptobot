@@ -29,8 +29,9 @@ class TradingConfig:
     min_trade_usdt: float = 5.0  # Minimum trade size in USDT
 
     # Risk management
-    stop_loss_percent: float = 8.0  # Exit if down 8%
+    stop_loss_percent: float = 3.0  # Exit if down 3%
     take_profit_percent: float = 20.0  # Exit if up 20%
+    trailing_stop_percent: float = 3.0  # Trail 3% below peak price
     daily_loss_limit_percent: float = 12.0  # Pause if daily loss > 12%
     max_open_positions: int = 3  # Maximum concurrent positions
 
@@ -79,6 +80,20 @@ class ModelConfig:
     train_test_split: float = 0.2  # 20% for validation
 
 
+@dataclass
+class FuturesConfig:
+    """Futures/perpetual swap configuration."""
+
+    enabled: bool = False
+    leverage: int = 2
+    margin_mode: str = "cross"  # "cross" or "isolated"
+    futures_pairs: List[str] = None  # Pairs enabled for futures trading
+
+    def __post_init__(self):
+        if self.futures_pairs is None:
+            self.futures_pairs = []
+
+
 class Config:
     """
     Main configuration class.
@@ -90,6 +105,7 @@ class Config:
         self._load_trading_config()
         self._load_exchange_config()
         self._load_model_config()
+        self._load_futures_config()
         self._validate()
 
     def _load_trading_config(self):
@@ -101,8 +117,9 @@ class Config:
         self.trading = TradingConfig(
             trading_pairs=pairs,
             max_position_percent=float(os.environ.get("MAX_POSITION_PERCENT", "25")),
-            stop_loss_percent=float(os.environ.get("STOP_LOSS_PERCENT", "8")),
+            stop_loss_percent=float(os.environ.get("STOP_LOSS_PERCENT", "3")),
             take_profit_percent=float(os.environ.get("TAKE_PROFIT_PERCENT", "20")),
+            trailing_stop_percent=float(os.environ.get("TRAILING_STOP_PERCENT", "3")),
             daily_loss_limit_percent=float(os.environ.get("DAILY_LOSS_LIMIT", "12")),
             max_open_positions=int(os.environ.get("MAX_OPEN_POSITIONS", "3")),
             min_confidence_to_trade=float(os.environ.get("MIN_CONFIDENCE", "0.70")),
@@ -126,6 +143,18 @@ class Config:
             lookback_days=int(os.environ.get("LOOKBACK_DAYS", "90")),
         )
 
+    def _load_futures_config(self):
+        """Load futures trading parameters."""
+        futures_pairs_str = os.environ.get("FUTURES_PAIRS", "")
+        futures_pairs = [p.strip() for p in futures_pairs_str.split(",") if p.strip()]
+
+        self.futures = FuturesConfig(
+            enabled=os.environ.get("FUTURES_ENABLED", "false").lower() == "true",
+            leverage=int(os.environ.get("FUTURES_LEVERAGE", "2")),
+            margin_mode=os.environ.get("FUTURES_MARGIN_MODE", "cross").lower(),
+            futures_pairs=futures_pairs,
+        )
+
     def _validate(self):
         """Validate configuration values."""
         # Validate trading pairs
@@ -146,9 +175,23 @@ class Config:
         if not (0.5 <= self.trading.min_confidence_to_trade <= 1.0):
             raise ValueError("min_confidence_to_trade must be between 0.5 and 1.0")
 
+        # Validate futures config
+        if self.futures.enabled:
+            if not (1 <= self.futures.leverage <= 3):
+                raise ValueError("futures leverage must be between 1 and 3 (safety limit)")
+            if self.futures.margin_mode not in ("cross", "isolated"):
+                raise ValueError("futures margin_mode must be 'cross' or 'isolated'")
+            if not self.futures.futures_pairs:
+                raise ValueError("FUTURES_PAIRS must be set when FUTURES_ENABLED=true")
+            for pair in self.futures.futures_pairs:
+                if pair not in self.trading.trading_pairs:
+                    raise ValueError(f"Futures pair {pair} must also be in TRADING_PAIRS")
+
         logger.info("Configuration validated successfully")
         logger.info(f"Trading pairs: {self.trading.trading_pairs}")
         logger.info(f"Demo mode: {self.exchange.demo_mode}")
+        if self.futures.enabled:
+            logger.info(f"Futures ENABLED: {self.futures.futures_pairs}, leverage={self.futures.leverage}x, margin={self.futures.margin_mode}")
 
     def __repr__(self):
         return (

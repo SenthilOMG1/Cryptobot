@@ -17,8 +17,9 @@ logger = logging.getLogger(__name__)
 class RiskLimits:
     """Risk limit configuration."""
     max_position_pct: float = 25.0       # Max 25% of portfolio per position
-    stop_loss_pct: float = 8.0           # Exit if down 8%
+    stop_loss_pct: float = 3.0           # Exit if down 3%
     take_profit_pct: float = 20.0        # Exit if up 20%
+    trailing_stop_pct: float = 3.0       # Trail 3% below peak price
     daily_loss_limit_pct: float = 12.0   # Pause if daily loss > 12%
     max_open_positions: int = 3          # Maximum concurrent positions
     min_confidence: float = 0.70         # Minimum confidence to trade
@@ -84,8 +85,8 @@ class RiskManager:
             logger.info(f"Trade rejected: confidence {decision.confidence:.2f} < {self.limits.min_confidence}")
             return False
 
-        # Check position count (for BUY orders)
-        if decision.action == 1:  # BUY
+        # Check position count (for BUY and short-open orders)
+        if decision.action in (1, -1):  # BUY or SELL (potential short open)
             current_positions = len(self.positions.get_all_positions())
             if current_positions >= self.limits.max_open_positions:
                 logger.warning(f"Trade rejected: max positions reached ({current_positions})")
@@ -161,6 +162,68 @@ class RiskManager:
             )
             return True
         return False
+
+    def check_trailing_stop(self, position) -> bool:
+        """
+        Check if trailing stop is triggered.
+
+        For longs: activates after 1%+ profit, triggers when price drops from peak.
+        For shorts: activates after 1%+ profit, triggers when price rises from trough.
+
+        Args:
+            position: Position object with highest_price/lowest_price tracked
+
+        Returns:
+            True if trailing stop triggered
+        """
+        if getattr(position, 'side', 'long') == "short":
+            # SHORT: trailing stop tracks the trough (lowest price)
+            # Activate after position has been at least 1% profitable (price dropped 1%+)
+            if position.lowest_price > position.entry_price * 0.99:
+                return False
+
+            # Calculate how far price has risen from trough
+            if position.lowest_price <= 0:
+                return False
+            rise_from_trough_pct = (
+                (position.current_price - position.lowest_price) / position.lowest_price
+            ) * 100
+
+            if rise_from_trough_pct >= self.limits.trailing_stop_pct:
+                trailing_stop_price = position.lowest_price * (1 + self.limits.trailing_stop_pct / 100)
+                locked_profit_pct = ((position.entry_price - trailing_stop_price) / position.entry_price) * 100
+
+                logger.info(
+                    f"TRAILING STOP triggered for {position.pair} (SHORT): "
+                    f"trough ${position.lowest_price:.2f} → now ${position.current_price:.2f} "
+                    f"(rose {rise_from_trough_pct:.1f}% from trough, locking ~{locked_profit_pct:.1f}% profit)"
+                )
+                return True
+
+            return False
+        else:
+            # LONG: trailing stop tracks the peak (highest price)
+            # Only activate after position has been at least 1% profitable
+            if position.highest_price < position.entry_price * 1.01:
+                return False
+
+            # Calculate how far price has dropped from peak
+            drop_from_peak_pct = (
+                (position.highest_price - position.current_price) / position.highest_price
+            ) * 100
+
+            if drop_from_peak_pct >= self.limits.trailing_stop_pct:
+                trailing_stop_price = position.highest_price * (1 - self.limits.trailing_stop_pct / 100)
+                locked_profit_pct = ((trailing_stop_price - position.entry_price) / position.entry_price) * 100
+
+                logger.info(
+                    f"TRAILING STOP triggered for {position.pair}: "
+                    f"peak ${position.highest_price:.2f} → now ${position.current_price:.2f} "
+                    f"(dropped {drop_from_peak_pct:.1f}% from peak, locking ~{locked_profit_pct:.1f}% profit)"
+                )
+                return True
+
+            return False
 
     def check_take_profit(self, position) -> bool:
         """

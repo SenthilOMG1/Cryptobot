@@ -50,7 +50,7 @@ def main():
     # Initialize vault and OKX client
     logger.info("Connecting to OKX...")
     vault = SecureVault()
-    okx = SecureOKXClient(vault, demo_mode=True)  # Use demo for data fetching
+    okx = SecureOKXClient(vault, demo_mode=config.exchange.demo_mode)
 
     if not okx.test_connection():
         logger.error("Failed to connect to OKX!")
@@ -131,7 +131,7 @@ def main():
     rl_metrics = rl_agent.train(
         combined_df,
         feature_cols,
-        total_timesteps=50000,
+        total_timesteps=200000,
         initial_balance=1000
     )
 

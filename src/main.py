@@ -61,6 +61,23 @@ def run_bot(status_dict):
                 time.sleep(60)
 
         logger.info("OKX connected!")
+
+        # ==================== FUTURES SETUP ====================
+        if config.futures.enabled:
+            logger.info("Futures trading ENABLED - configuring...")
+            try:
+                okx.set_position_mode("net_mode")
+                logger.info("Position mode set to net_mode")
+                for pair in config.futures.futures_pairs:
+                    okx.set_leverage(pair, config.futures.leverage, config.futures.margin_mode)
+                    logger.info(f"Leverage set: {pair} -> {config.futures.leverage}x ({config.futures.margin_mode})")
+            except Exception as e:
+                logger.error(f"Futures setup failed: {e}")
+                logger.warning("Continuing with spot-only trading")
+                config.futures.enabled = False
+        else:
+            logger.info("Futures trading disabled (FUTURES_ENABLED=false)")
+
         status_dict["state"] = "initializing"
         status_dict["message"] = "Loading ML models..."
 
@@ -68,6 +85,8 @@ def run_bot(status_dict):
         features = FeatureEngine()
         positions = PositionTracker(okx)
         positions.sync_from_exchange()
+        if config.futures.enabled:
+            positions.sync_futures_from_exchange(config.futures.futures_pairs)
 
         xgb_model = XGBoostPredictor(model_path="models/xgboost_model.json")
         rl_agent = RLTradingAgent(model_path="models/rl_agent.zip")
@@ -83,6 +102,7 @@ def run_bot(status_dict):
             max_position_pct=config.trading.max_position_percent,
             stop_loss_pct=config.trading.stop_loss_percent,
             take_profit_pct=config.trading.take_profit_percent,
+            trailing_stop_pct=config.trading.trailing_stop_percent,
             daily_loss_limit_pct=config.trading.daily_loss_limit_percent,
             max_open_positions=config.trading.max_open_positions,
             min_confidence=config.trading.min_confidence_to_trade
@@ -116,18 +136,45 @@ def run_bot(status_dict):
                     time.sleep(3600)
                     continue
 
-                # Check positions for stop-loss/take-profit
-                for pos in positions.get_all_positions():
-                    if risk.check_stop_loss(pos):
-                        logger.warning(f"STOP-LOSS: {pos.pair}")
-                        result = executor.close_position(pos.pair, pos.entry_price)
-                        if result.success:
-                            positions.remove_position(pos.pair)
-                    elif risk.check_take_profit(pos):
-                        logger.info(f"TAKE-PROFIT: {pos.pair}")
-                        result = executor.close_position(pos.pair, pos.entry_price)
-                        if result.success:
-                            positions.remove_position(pos.pair)
+                # Check positions for stop-loss/trailing-stop/take-profit
+                for position in positions.get_all_positions():
+                    pair = position.pair
+                    mode_label = f" ({position.mode} {position.side})" if position.mode == "futures" else ""
+                    logger.info(
+                        f"  {pair}{mode_label}: ${position.current_price:.2f} | "
+                        f"P&L: {position.unrealized_pnl_pct:+.2f}%"
+                    )
+
+                    def _close_this_position(pos=position):
+                        if pos.mode == "futures":
+                            result = executor.close_futures_position(
+                                pos.pair, pos.entry_price, config.futures.margin_mode
+                            )
+                            if result.success:
+                                positions.remove_futures_position(pos.pair)
+                                risk.record_trade()
+                            return result
+                        else:
+                            result = executor.close_position(pos.pair, pos.entry_price)
+                            if result.success:
+                                positions.remove_position(pos.pair)
+                                risk.record_trade()
+                            return result
+
+                    if risk.check_stop_loss(position):
+                        logger.warning(f"STOP-LOSS: {pair}{mode_label}")
+                        _close_this_position()
+                        continue
+
+                    if risk.check_trailing_stop(position):
+                        logger.info(f"TRAILING STOP: {pair}{mode_label} - locking profit")
+                        _close_this_position()
+                        continue
+
+                    if risk.check_take_profit(position):
+                        logger.info(f"TAKE-PROFIT: {pair}{mode_label}")
+                        _close_this_position()
+                        continue
 
                 # Analyze pairs
                 for pair in config.trading.trading_pairs:
@@ -161,6 +208,23 @@ def run_bot(status_dict):
                             if result.success:
                                 positions.add_position(pair, result.amount, result.price)
                                 logger.info(f"Bought {result.amount} {pair} @ ${result.price}")
+
+                        elif decision.action == Action.SELL:
+                            # SELL signal with no spot position - open short if futures enabled
+                            if (config.futures.enabled
+                                    and pair in config.futures.futures_pairs
+                                    and not positions.has_position(pair, mode="futures")):
+                                logger.info(f"SHORT {pair} (conf: {decision.confidence:.2f})")
+                                result = executor.execute_short_open(decision, price, config.futures)
+                                if result.success:
+                                    positions.add_position(
+                                        pair, result.amount, result.price,
+                                        side="short", mode="futures"
+                                    )
+                                    risk.record_trade()
+                                    logger.info(f"Shorted {result.amount} {pair} @ ${result.price}")
+                            else:
+                                logger.debug(f"SELL signal for {pair} but no position")
 
                     except Exception as e:
                         logger.error(f"Error on {pair}: {e}")
