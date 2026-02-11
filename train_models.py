@@ -67,12 +67,17 @@ def main():
     for pair in trading_pairs:
         logger.info(f"  Fetching {pair}...")
         try:
-            # Get 60 days of hourly data
-            df = collector.get_historical_data(pair, days=60, timeframe="1h")
-            logger.info(f"    Got {len(df)} candles")
+            # Get 180 days of hourly data (3x more training data)
+            df_1h = collector.get_historical_data(pair, days=180, timeframe="1h")
+            logger.info(f"    Got {len(df_1h)} 1H candles")
 
-            # Calculate features
-            df_features = features.calculate_features(df)
+            # Fetch higher timeframes for multi-TF features
+            df_4h = collector.get_historical_data(pair, days=180, timeframe="4h")
+            df_1d = collector.get_historical_data(pair, days=180, timeframe="1d")
+            logger.info(f"    Got {len(df_4h)} 4H + {len(df_1d)} 1D candles")
+
+            # Calculate multi-timeframe features
+            df_features = features.calculate_multi_tf_features(df_1h, df_4h, df_1d)
             logger.info(f"    Calculated {len(features.get_feature_names())} features")
 
             # Create labels
@@ -131,7 +136,7 @@ def main():
     rl_metrics = rl_agent.train(
         combined_df,
         feature_cols,
-        total_timesteps=200000,
+        total_timesteps=500000,
         initial_balance=1000
     )
 

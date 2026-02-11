@@ -82,14 +82,21 @@ class AutoRetrainer:
         }
 
         try:
-            # Collect training data from all pairs
+            # Collect training data from all pairs (multi-timeframe)
             all_data = []
             for pair in trading_pairs:
                 logger.info(f"Collecting data for {pair}...")
-                df = self.collector.get_historical_data(pair, days=90, timeframe="1h")
+                df_1h = self.collector.get_historical_data(pair, days=180, timeframe="1h")
 
-                # Calculate features
-                df_features = self.features.calculate_features(df)
+                # Fetch higher timeframes
+                try:
+                    df_4h = self.collector.get_historical_data(pair, days=180, timeframe="4h")
+                    df_1d = self.collector.get_historical_data(pair, days=180, timeframe="1d")
+                except Exception:
+                    df_4h, df_1d = None, None
+
+                # Calculate multi-TF features
+                df_features = self.features.calculate_multi_tf_features(df_1h, df_4h, df_1d)
 
                 # Add target labels
                 from ..data.features import create_target_labels
@@ -146,7 +153,7 @@ class AutoRetrainer:
                 rl_metrics = self.rl_agent.train(
                     combined_df,
                     feature_cols,
-                    total_timesteps=200000
+                    total_timesteps=500000
                 )
                 results["rl_result"] = rl_metrics
                 self.rl_agent.save_model()

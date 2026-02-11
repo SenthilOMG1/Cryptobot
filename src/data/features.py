@@ -283,6 +283,130 @@ class FeatureEngine:
 
         return df
 
+    def calculate_multi_tf_features(
+        self,
+        candles_1h: pd.DataFrame,
+        candles_4h: pd.DataFrame = None,
+        candles_1d: pd.DataFrame = None
+    ) -> pd.DataFrame:
+        """
+        Calculate features from multiple timeframes.
+
+        Args:
+            candles_1h: 1-hour OHLCV candles (primary timeframe)
+            candles_4h: 4-hour OHLCV candles (optional, for trend context)
+            candles_1d: 1-day OHLCV candles (optional, for macro context)
+
+        Returns:
+            DataFrame with 1H features + higher-TF features merged by timestamp
+        """
+        # Calculate full 1H features as base
+        df = self.calculate_features(candles_1h)
+
+        if df.empty:
+            return df
+
+        # Add 4H timeframe features
+        if candles_4h is not None and len(candles_4h) >= 20:
+            try:
+                df_4h = self._calc_higher_tf_features(candles_4h, prefix="tf4h")
+                if not df_4h.empty and "timestamp" in df.columns and "timestamp" in df_4h.columns:
+                    df = pd.merge_asof(
+                        df.sort_values("timestamp"),
+                        df_4h.sort_values("timestamp"),
+                        on="timestamp",
+                        direction="backward"
+                    )
+            except Exception as e:
+                logger.warning(f"4H features failed: {e}")
+
+        # Add 1D timeframe features
+        if candles_1d is not None and len(candles_1d) >= 10:
+            try:
+                df_1d = self._calc_higher_tf_features(candles_1d, prefix="tf1d")
+                if not df_1d.empty and "timestamp" in df.columns and "timestamp" in df_1d.columns:
+                    df = pd.merge_asof(
+                        df.sort_values("timestamp"),
+                        df_1d.sort_values("timestamp"),
+                        on="timestamp",
+                        direction="backward"
+                    )
+            except Exception as e:
+                logger.warning(f"1D features failed: {e}")
+
+        # Drop NaN rows from merge and update feature names
+        df = df.dropna()
+        price_cols = ["timestamp", "open", "high", "low", "close", "volume"]
+        self.feature_names = [c for c in df.columns if c not in price_cols]
+
+        logger.info(f"Multi-TF features: {len(self.feature_names)} total")
+        return df
+
+    def _calc_higher_tf_features(self, candles: pd.DataFrame, prefix: str) -> pd.DataFrame:
+        """
+        Calculate key indicators from a higher timeframe.
+        Returns a slim DataFrame with timestamp + prefixed feature columns.
+        """
+        df = candles.copy()
+        df.columns = [c.lower() for c in df.columns]
+        close = df["close"]
+        high = df["high"]
+        low = df["low"]
+        result = pd.DataFrame()
+        result["timestamp"] = df["timestamp"]
+
+        # RSI
+        if len(df) >= 14:
+            result[f"{prefix}_rsi"] = RSIIndicator(close, window=14).rsi()
+
+        # MACD
+        if len(df) >= 26:
+            macd = MACD(close)
+            result[f"{prefix}_macd"] = macd.macd()
+            result[f"{prefix}_macd_signal"] = macd.macd_signal()
+            result[f"{prefix}_macd_hist"] = macd.macd_diff()
+
+        # SMAs and price position
+        for period in [20, 50]:
+            if len(df) >= period:
+                sma = SMAIndicator(close, window=period).sma_indicator()
+                result[f"{prefix}_sma_{period}"] = sma
+                result[f"{prefix}_price_vs_sma{period}"] = (close - sma) / sma
+
+        # EMA
+        if len(df) >= 21:
+            ema = EMAIndicator(close, window=21).ema_indicator()
+            result[f"{prefix}_ema_21"] = ema
+
+        # ADX (trend strength)
+        if len(df) >= 14:
+            adx = ADXIndicator(high, low, close)
+            result[f"{prefix}_adx"] = adx.adx()
+
+        # ATR (volatility)
+        if len(df) >= 14:
+            result[f"{prefix}_atr"] = AverageTrueRange(high, low, close, window=14).average_true_range()
+
+        # Bollinger Band position
+        if len(df) >= 20:
+            bb = BollingerBands(close)
+            bb_upper = bb.bollinger_hband()
+            bb_lower = bb.bollinger_lband()
+            result[f"{prefix}_bb_pos"] = (close - bb_lower) / (bb_upper - bb_lower)
+            result[f"{prefix}_bb_width"] = (bb_upper - bb_lower) / bb.bollinger_mavg()
+
+        # Returns
+        result[f"{prefix}_return_1"] = close.pct_change(periods=1)
+        if len(df) >= 5:
+            result[f"{prefix}_return_5"] = close.pct_change(periods=5)
+
+        # Stochastic
+        if len(df) >= 14:
+            stoch = StochasticOscillator(high, low, close)
+            result[f"{prefix}_stoch_k"] = stoch.stoch()
+
+        return result.dropna()
+
     def get_feature_names(self) -> list:
         """Return list of calculated feature names."""
         return self.feature_names

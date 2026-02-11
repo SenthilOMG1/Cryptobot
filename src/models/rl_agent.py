@@ -239,17 +239,20 @@ class RLTradingAgent:
         self.is_trained = False
         self.feature_columns: list = []
 
-        # PPO hyperparameters
+        # PPO hyperparameters (upgraded for VPS hardware)
         self.ppo_params = {
-            "learning_rate": 0.0003,
-            "n_steps": 2048,
-            "batch_size": 64,
-            "n_epochs": 10,
+            "learning_rate": 0.0001,
+            "n_steps": 4096,
+            "batch_size": 128,
+            "n_epochs": 15,
             "gamma": 0.99,
             "gae_lambda": 0.95,
             "clip_range": 0.2,
-            "ent_coef": 0.05,  # Entropy bonus - prevents policy collapse to single action
+            "ent_coef": 0.03,  # Slightly lower entropy - bigger network explores naturally
+            "vf_coef": 0.5,
+            "max_grad_norm": 0.5,
             "verbose": 0,
+            "policy_kwargs": dict(net_arch=[256, 128]),  # Bigger network (was 64, 64)
         }
 
         # Try to load existing model

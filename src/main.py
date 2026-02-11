@@ -68,11 +68,18 @@ def run_bot(status_dict):
             try:
                 okx.set_position_mode("net_mode")
                 logger.info("Position mode set to net_mode")
+            except Exception as e:
+                # Error 59000 = can't change mode with open positions (already set)
+                if "59000" in str(e):
+                    logger.info("Position mode already set (open positions exist) - OK")
+                else:
+                    logger.error(f"Position mode setup failed: {e}")
+            try:
                 for pair in config.futures.futures_pairs:
                     okx.set_leverage(pair, config.futures.leverage, config.futures.margin_mode)
                     logger.info(f"Leverage set: {pair} -> {config.futures.leverage}x ({config.futures.margin_mode})")
             except Exception as e:
-                logger.error(f"Futures setup failed: {e}")
+                logger.error(f"Leverage setup failed: {e}")
                 logger.warning("Continuing with spot-only trading")
                 config.futures.enabled = False
         else:
@@ -182,16 +189,25 @@ def run_bot(status_dict):
                         if positions.has_position(pair):
                             continue
 
-                        candles = collector.get_candles(pair, "1h", 100)
-                        if len(candles) < 50:
+                        candles_1h = collector.get_candles(pair, "1h", 300)
+                        if len(candles_1h) < 50:
                             continue
 
-                        df_features = features.calculate_features(candles)
+                        # Fetch higher timeframes for better context
+                        try:
+                            candles_4h = collector.get_candles(pair, "4h", 100)
+                            candles_1d = collector.get_candles(pair, "1d", 100)
+                        except Exception:
+                            candles_4h, candles_1d = None, None
+
+                        df_features = features.calculate_multi_tf_features(
+                            candles_1h, candles_4h, candles_1d
+                        )
                         if df_features.empty:
                             continue
 
                         latest = df_features.iloc[[-1]]
-                        price = float(candles["close"].iloc[-1])
+                        price = float(candles_1h["close"].iloc[-1])
 
                         portfolio_state = {
                             "balance": okx.get_usdt_balance(),
@@ -252,17 +268,23 @@ def run_bot(status_dict):
 
 
 def initial_training(collector, features, xgb_model, rl_agent, trading_pairs):
-    """Train models on historical data."""
+    """Train models on historical data with multi-timeframe features."""
     import pandas as pd
     from src.data.features import create_target_labels
 
-    logger.info("Collecting training data...")
+    logger.info("Collecting training data (180 days, multi-timeframe)...")
     all_data = []
 
     for pair in trading_pairs:
         try:
-            df = collector.get_historical_data(pair, days=60, timeframe="1h")
-            df_features = features.calculate_features(df)
+            df_1h = collector.get_historical_data(pair, days=180, timeframe="1h")
+            try:
+                df_4h = collector.get_historical_data(pair, days=180, timeframe="4h")
+                df_1d = collector.get_historical_data(pair, days=180, timeframe="1d")
+            except Exception:
+                df_4h, df_1d = None, None
+
+            df_features = features.calculate_multi_tf_features(df_1h, df_4h, df_1d)
             df_features["target"] = create_target_labels(df_features)
             df_features["pair"] = pair
             all_data.append(df_features)
@@ -280,7 +302,7 @@ def initial_training(collector, features, xgb_model, rl_agent, trading_pairs):
     y = combined["target"]
 
     xgb_model.train(X, y)
-    rl_agent.train(combined, feature_cols, total_timesteps=50000)
+    rl_agent.train(combined, feature_cols, total_timesteps=500000)
 
     logger.info("Training complete!")
 

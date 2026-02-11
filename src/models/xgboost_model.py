@@ -46,22 +46,25 @@ class XGBoostPredictor:
         self.model_path = model_path or "models/xgboost_model.json"
         self.is_trained = False
 
-        # Default hyperparameters (optimized for trading)
+        # Default hyperparameters (optimized for trading - upgraded for VPS hardware)
         self.params = {
-            "n_estimators": 150,
-            "max_depth": 4,
-            "learning_rate": 0.05,
+            "n_estimators": 500,
+            "max_depth": 6,
+            "learning_rate": 0.03,
             "objective": "multi:softprob",
             "num_class": 3,  # UP, DOWN, HOLD
             "eval_metric": "mlogloss",
             "use_label_encoder": False,
             "random_state": 42,
             "n_jobs": -1,  # Use all CPU cores
-            "min_child_weight": 3,
+            "min_child_weight": 5,
             "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "reg_alpha": 0.1,
-            "reg_lambda": 1.0,
+            "colsample_bytree": 0.7,
+            "colsample_bylevel": 0.7,
+            "reg_alpha": 0.3,
+            "reg_lambda": 2.0,
+            "max_delta_step": 1,
+            "early_stopping_rounds": 30,
         }
 
         # Try to load existing model
@@ -110,10 +113,12 @@ class XGBoostPredictor:
         class_weights = {cls: total / (n_classes * count) for cls, count in counts.items()}
         sample_weights = y_train.map(class_weights).values
 
-        # Create model
-        self.model = xgb.XGBClassifier(**self.params)
+        # Create model (extract early_stopping_rounds from params)
+        model_params = {k: v for k, v in self.params.items() if k != "early_stopping_rounds"}
+        early_stopping = self.params.get("early_stopping_rounds", 30)
+        self.model = xgb.XGBClassifier(**model_params)
 
-        # Train with class balancing (no early stopping - let it use all rounds)
+        # Train with class balancing and early stopping
         self.model.fit(
             X_train, y_train,
             sample_weight=sample_weights,

@@ -204,31 +204,30 @@ class EnsembleDecider:
                     "Both agree SELL but confidence too low"
                 )
 
-        # Case 3: One model is very confident (>85%) - allow single model decision
-        if not self.agreement_required:
-            if xgb_action != Action.HOLD and xgb_conf > 0.85:
-                return TradeDecision(
-                    action=xgb_action,
-                    confidence=xgb_conf * 0.8,  # Reduce confidence for single model
-                    xgb_action=xgb_action,
-                    xgb_confidence=xgb_conf,
-                    rl_action=rl_action,
-                    rl_confidence=rl_conf,
-                    reasoning=f"XGBoost high-confidence signal (RL disagrees)",
-                    suggested_size_pct=self._calculate_position_size(xgb_conf * 0.8)
-                )
+        # Case 3: One model is very confident (>80%) - allow single model override
+        if xgb_action != Action.HOLD and xgb_conf > 0.80:
+            return TradeDecision(
+                action=xgb_action,
+                confidence=xgb_conf * 0.8,  # Reduce confidence for single model
+                xgb_action=xgb_action,
+                xgb_confidence=xgb_conf,
+                rl_action=rl_action,
+                rl_confidence=rl_conf,
+                reasoning=f"XGBoost high-confidence signal (RL disagrees)",
+                suggested_size_pct=self._calculate_position_size(xgb_conf * 0.8)
+            )
 
-            if rl_action != Action.HOLD and rl_conf > 0.85:
-                return TradeDecision(
-                    action=rl_action,
-                    confidence=rl_conf * 0.8,
-                    xgb_action=xgb_action,
-                    xgb_confidence=xgb_conf,
-                    rl_action=rl_action,
-                    rl_confidence=rl_conf,
-                    reasoning=f"RL high-confidence signal (XGBoost disagrees)",
-                    suggested_size_pct=self._calculate_position_size(rl_conf * 0.8)
-                )
+        if rl_action != Action.HOLD and rl_conf > 0.80:
+            return TradeDecision(
+                action=rl_action,
+                confidence=rl_conf * 0.8,
+                xgb_action=xgb_action,
+                xgb_confidence=xgb_conf,
+                rl_action=rl_action,
+                rl_confidence=rl_conf,
+                reasoning=f"RL high-confidence signal (XGBoost disagrees)",
+                suggested_size_pct=self._calculate_position_size(rl_conf * 0.8)
+            )
 
         # Case 4: Disagreement or low confidence -> HOLD
         reason = "Models disagree" if xgb_action != rl_action else "Both models suggest HOLD"
