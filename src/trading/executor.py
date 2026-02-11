@@ -408,7 +408,70 @@ class TradeExecutor:
             error="Failed to close position"
         )
 
-    def execute_short_open(self, decision, current_price: float, futures_config) -> TradeResult:
+    @staticmethod
+    def calculate_dynamic_leverage(confidence: float, max_leverage: int = 7) -> int:
+        """
+        Calculate leverage based on model confidence.
+
+        Higher confidence = higher leverage for bigger instant profits.
+        Lower confidence = lower leverage for safety.
+
+        Tiers:
+            50-55% → 2x (cautious entry)
+            55-65% → 3x (moderate)
+            65-75% → 5x (confident)
+            75%+   → max_leverage (very confident, quick profit scenario)
+
+        Args:
+            confidence: Model confidence (0.0 to 1.0)
+            max_leverage: Maximum allowed leverage (from config)
+
+        Returns:
+            Leverage multiplier (int)
+        """
+        if confidence >= 0.75:
+            return max_leverage  # Full send - bot is very confident
+        elif confidence >= 0.65:
+            return min(5, max_leverage)
+        elif confidence >= 0.55:
+            return min(3, max_leverage)
+        else:
+            return 2  # Minimum leverage for low confidence
+
+    @staticmethod
+    def calculate_adaptive_leverage(position, max_leverage: int = 7) -> int:
+        """
+        Adjust leverage on open position based on how the trade is going.
+
+        Strategy:
+        - Losing > 1%: drop to 2x (defensive, protect capital)
+        - Flat (±1%): keep at 3x (cautious)
+        - Gaining 1-3%: restore to entry leverage
+        - Gaining 3%+: boost to max (ride the wave for max profit)
+
+        Args:
+            position: Position object with unrealized_pnl_pct
+            max_leverage: Maximum allowed leverage
+
+        Returns:
+            New leverage multiplier (int)
+        """
+        pnl_pct = position.unrealized_pnl_pct
+
+        if pnl_pct <= -1.0:
+            # Losing - go defensive
+            return 2
+        elif pnl_pct <= 1.0:
+            # Flat - stay cautious
+            return min(3, max_leverage)
+        elif pnl_pct <= 3.0:
+            # Gaining - restore to entry leverage
+            return position.leverage  # Keep current
+        else:
+            # Big gain - max leverage to ride the wave
+            return max_leverage
+
+    def execute_short_open(self, decision, current_price: float, futures_config, dynamic_leverage: int = None) -> TradeResult:
         """
         Open a short position via perpetual swap.
 
@@ -416,8 +479,10 @@ class TradeExecutor:
             decision: TradeDecision from ensemble (action == SELL)
             current_price: Current price of the asset
             futures_config: FuturesConfig with leverage/margin settings
+            dynamic_leverage: Override leverage (from dynamic calculation)
         """
         pair = decision.pair
+        leverage = dynamic_leverage or futures_config.leverage
 
         # Validate with risk manager
         if not self.risk.validate_trade(decision):
@@ -428,6 +493,14 @@ class TradeExecutor:
             )
 
         try:
+            # Set leverage for this trade before placing order
+            try:
+                self.okx.set_leverage(pair, leverage, futures_config.margin_mode)
+                logger.info(f"Dynamic leverage set: {pair} → {leverage}x")
+            except Exception as e:
+                logger.warning(f"Failed to set leverage {leverage}x for {pair}: {e}")
+                leverage = 2  # Fallback to safe leverage
+
             # Get available USDT balance
             usdt_balance = self.okx.get_usdt_balance()
 
@@ -442,7 +515,7 @@ class TradeExecutor:
 
             # Calculate number of contracts
             # With leverage, our margin buys more exposure
-            effective_usdt = trade_amount_usdt * futures_config.leverage
+            effective_usdt = trade_amount_usdt * leverage
             num_contracts = int(effective_usdt / (ct_val * current_price))
 
             if num_contracts < min_sz:
@@ -454,7 +527,8 @@ class TradeExecutor:
 
             logger.info(
                 f"Opening SHORT: {pair}, {num_contracts} contracts "
-                f"(${trade_amount_usdt:.2f} margin, {futures_config.leverage}x leverage)"
+                f"(${trade_amount_usdt:.2f} margin, {leverage}x dynamic leverage, "
+                f"conf: {decision.confidence:.0%})"
             )
 
             # Place sell order on swap to open short
@@ -490,6 +564,10 @@ class TradeExecutor:
                     total_value=amount_base * fill_price,
                     fee=abs(fee)
                 )
+
+                # Store leverage info on the result for position tracking
+                trade_result._leverage = leverage
+                trade_result._max_leverage = futures_config.leverage
 
                 self._record_trade(trade_result, decision)
                 return trade_result

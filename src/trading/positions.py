@@ -26,6 +26,9 @@ class Position:
     highest_price: float = 0.0
     lowest_price: float = 0.0
     mode: str = "spot"  # "spot" or "futures"
+    leverage: int = 1  # Current leverage for futures positions
+    max_leverage: int = 1  # Max leverage allowed (from confidence at entry)
+    entry_confidence: float = 0.0  # Confidence when position was opened
 
     def update_price(self, price: float):
         """Update position with current price. Direction-aware P&L."""
@@ -161,7 +164,10 @@ class PositionTracker:
         amount: float,
         entry_price: float,
         side: str = "long",
-        mode: str = "spot"
+        mode: str = "spot",
+        leverage: int = 1,
+        max_leverage: int = 1,
+        entry_confidence: float = 0.0
     ) -> Position:
         """
         Add a new position.
@@ -172,6 +178,9 @@ class PositionTracker:
             entry_price: Entry price
             side: "long" or "short"
             mode: "spot" or "futures"
+            leverage: Current leverage used
+            max_leverage: Max leverage allowed for this position
+            entry_confidence: Confidence score at entry
 
         Returns:
             Position object
@@ -185,7 +194,10 @@ class PositionTracker:
             current_price=entry_price,
             highest_price=entry_price,
             lowest_price=entry_price,
-            mode=mode
+            mode=mode,
+            leverage=leverage,
+            max_leverage=max_leverage,
+            entry_confidence=entry_confidence
         )
 
         # Use different key for futures to allow both spot and futures on same pair

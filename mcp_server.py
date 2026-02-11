@@ -332,7 +332,8 @@ def _register_tools(mcp: FastMCP):
             futures_section = f"""
 FUTURES:
   Enabled: YES
-  Leverage: {config.get('FUTURES_LEVERAGE', '2')}x
+  Max Leverage: {config.get('FUTURES_LEVERAGE', '2')}x (dynamic per-trade)
+  Leverage Mode: Dynamic (2x-{config.get('FUTURES_LEVERAGE', '7')}x based on confidence)
   Margin Mode: {config.get('FUTURES_MARGIN_MODE', 'cross')}
   Futures Pairs: {config.get('FUTURES_PAIRS', 'none')}"""
         else:

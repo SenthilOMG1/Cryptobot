@@ -75,9 +75,10 @@ def run_bot(status_dict):
                 else:
                     logger.error(f"Position mode setup failed: {e}")
             try:
+                # Set initial leverage to 2x (minimum) - dynamic leverage adjusts per-trade
                 for pair in config.futures.futures_pairs:
-                    okx.set_leverage(pair, config.futures.leverage, config.futures.margin_mode)
-                    logger.info(f"Leverage set: {pair} -> {config.futures.leverage}x ({config.futures.margin_mode})")
+                    okx.set_leverage(pair, 2, config.futures.margin_mode)
+                logger.info(f"Futures initialized: max {config.futures.leverage}x, dynamic leverage per-trade")
             except Exception as e:
                 logger.error(f"Leverage setup failed: {e}")
                 logger.warning("Continuing with spot-only trading")
@@ -143,12 +144,13 @@ def run_bot(status_dict):
                     time.sleep(3600)
                     continue
 
-                # Check positions for stop-loss/trailing-stop/take-profit
+                # Check positions for stop-loss/trailing-stop/take-profit + adaptive leverage
                 for position in positions.get_all_positions():
                     pair = position.pair
                     mode_label = f" ({position.mode} {position.side})" if position.mode == "futures" else ""
+                    lev_label = f" {position.leverage}x" if position.mode == "futures" else ""
                     logger.info(
-                        f"  {pair}{mode_label}: ${position.current_price:.2f} | "
+                        f"  {pair}{mode_label}{lev_label}: ${position.current_price:.2f} | "
                         f"P&L: {position.unrealized_pnl_pct:+.2f}%"
                     )
 
@@ -182,6 +184,23 @@ def run_bot(status_dict):
                         logger.info(f"TAKE-PROFIT: {pair}{mode_label}")
                         _close_this_position()
                         continue
+
+                    # Adaptive leverage adjustment for open futures positions
+                    if position.mode == "futures" and config.futures.enabled:
+                        new_lev = executor.calculate_adaptive_leverage(
+                            position, config.futures.leverage
+                        )
+                        if new_lev != position.leverage:
+                            try:
+                                okx.set_leverage(pair, new_lev, config.futures.margin_mode)
+                                old_lev = position.leverage
+                                position.leverage = new_lev
+                                logger.info(
+                                    f"LEVERAGE ADJUSTED: {pair} {old_lev}x → {new_lev}x "
+                                    f"(P&L: {position.unrealized_pnl_pct:+.1f}%)"
+                                )
+                            except Exception as e:
+                                logger.warning(f"Leverage adjustment failed for {pair}: {e}")
 
                 # Analyze pairs
                 for pair in config.trading.trading_pairs:
@@ -230,15 +249,31 @@ def run_bot(status_dict):
                             if (config.futures.enabled
                                     and pair in config.futures.futures_pairs
                                     and not positions.has_position(pair, mode="futures")):
-                                logger.info(f"SHORT {pair} (conf: {decision.confidence:.2f})")
-                                result = executor.execute_short_open(decision, price, config.futures)
+                                # Dynamic leverage based on confidence
+                                dyn_leverage = executor.calculate_dynamic_leverage(
+                                    decision.confidence, config.futures.leverage
+                                )
+                                logger.info(
+                                    f"SHORT {pair} (conf: {decision.confidence:.2f}, "
+                                    f"leverage: {dyn_leverage}x)"
+                                )
+                                result = executor.execute_short_open(
+                                    decision, price, config.futures,
+                                    dynamic_leverage=dyn_leverage
+                                )
                                 if result.success:
                                     positions.add_position(
                                         pair, result.amount, result.price,
-                                        side="short", mode="futures"
+                                        side="short", mode="futures",
+                                        leverage=dyn_leverage,
+                                        max_leverage=config.futures.leverage,
+                                        entry_confidence=decision.confidence
                                     )
                                     risk.record_trade()
-                                    logger.info(f"Shorted {result.amount} {pair} @ ${result.price}")
+                                    logger.info(
+                                        f"Shorted {result.amount} {pair} @ ${result.price} "
+                                        f"({dyn_leverage}x leverage)"
+                                    )
                             else:
                                 logger.debug(f"SELL signal for {pair} but no position")
 
