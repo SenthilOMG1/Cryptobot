@@ -1,7 +1,13 @@
 """
-Auto Retrainer
-==============
+Auto Retrainer V2
+=================
 Automatically retrains ML models as market conditions change.
+
+V2 Upgrades:
+- Walk-forward validation gate before deploying XGBoost
+- LSTM retraining alongside XGBoost
+- 2M steps for RL training (with checkpoint resume)
+- Checkpoint-based RL resume
 """
 
 import os
@@ -19,9 +25,10 @@ class AutoRetrainer:
 
     Features:
     - Retrains models on schedule (weekly by default)
-    - Uses latest market data
-    - Validates new models before deployment
-    - Only deploys if new model is better
+    - Walk-forward validation gate for XGBoost
+    - LSTM retraining alongside XGBoost
+    - RL training with 2M steps and checkpoint resume
+    - Only deploys if new model passes validation
     """
 
     def __init__(
@@ -30,35 +37,25 @@ class AutoRetrainer:
         feature_engine,
         xgb_model,
         rl_agent,
+        lstm_model=None,
         retrain_interval_days: int = 7,
-        min_improvement: float = 0.02  # 2% minimum improvement required
+        min_improvement: float = 0.02
     ):
-        """
-        Initialize auto retrainer.
-
-        Args:
-            data_collector: DataCollector instance
-            feature_engine: FeatureEngine instance
-            xgb_model: XGBoostPredictor instance
-            rl_agent: RLTradingAgent instance
-            retrain_interval_days: Days between retraining
-            min_improvement: Minimum accuracy improvement to deploy new model
-        """
         self.collector = data_collector
         self.features = feature_engine
         self.xgb_model = xgb_model
         self.rl_agent = rl_agent
+        self.lstm_model = lstm_model
         self.retrain_interval = timedelta(days=retrain_interval_days)
         self.min_improvement = min_improvement
 
-        self.last_retrain: Optional[datetime] = datetime.now()  # Don't retrain on first boot
+        self.last_retrain: Optional[datetime] = datetime.now()
         self.retrain_history: list = []
 
     def should_retrain(self) -> bool:
         """Check if it's time to retrain."""
         if self.last_retrain is None:
             return True
-
         time_since_retrain = datetime.now() - self.last_retrain
         return time_since_retrain >= self.retrain_interval
 
@@ -66,17 +63,18 @@ class AutoRetrainer:
         """
         Retrain all models with latest data.
 
-        Args:
-            trading_pairs: List of trading pairs to train on
-
-        Returns:
-            Dict with retraining results
+        Pipeline:
+        1. Collect data from all pairs
+        2. Train XGBoost (with walk-forward validation gate)
+        3. Train LSTM (if available)
+        4. Train RL (every 4th retrain, 2M steps with checkpoint resume)
         """
         logger.info("Starting model retraining...")
         results = {
             "started_at": datetime.now().isoformat(),
             "pairs": trading_pairs,
             "xgb_result": None,
+            "lstm_result": None,
             "rl_result": None,
             "deployed": False
         }
@@ -88,30 +86,25 @@ class AutoRetrainer:
                 logger.info(f"Collecting data for {pair}...")
                 df_1h = self.collector.get_historical_data(pair, days=180, timeframe="1h")
 
-                # Fetch higher timeframes
                 try:
                     df_4h = self.collector.get_historical_data(pair, days=180, timeframe="4h")
                     df_1d = self.collector.get_historical_data(pair, days=180, timeframe="1d")
                 except Exception:
                     df_4h, df_1d = None, None
 
-                # Calculate multi-TF features
                 df_features = self.features.calculate_multi_tf_features(df_1h, df_4h, df_1d)
 
-                # Add target labels
                 from ..data.features import create_target_labels
                 df_features["target"] = create_target_labels(df_features)
                 df_features["pair"] = pair
 
                 all_data.append(df_features)
 
-            # Combine all data
             combined_df = pd.concat(all_data, ignore_index=True)
             combined_df = combined_df.dropna()
 
             logger.info(f"Training data: {len(combined_df)} samples")
 
-            # Prepare features and labels
             feature_cols = self.features.get_feature_names()
             X = combined_df[feature_cols]
             y = combined_df["target"]
@@ -119,12 +112,11 @@ class AutoRetrainer:
             # Store current model performance
             old_xgb_accuracy = self._evaluate_model(self.xgb_model, X, y)
 
-            # Train new XGBoost model
+            # ===== TRAIN XGBOOST =====
             logger.info("Training XGBoost model...")
             xgb_metrics = self.xgb_model.train(X, y)
             results["xgb_result"] = xgb_metrics
 
-            # Evaluate new model
             new_xgb_accuracy = xgb_metrics["validation_accuracy"]
             improvement = new_xgb_accuracy - old_xgb_accuracy
 
@@ -134,26 +126,64 @@ class AutoRetrainer:
                 f"Improvement: {improvement:.3f}"
             )
 
-            # Only deploy if improved enough
-            if improvement >= self.min_improvement:
-                logger.info("XGBoost model improved - deploying!")
-                self.xgb_model.save_model()
-                results["deployed"] = True
-            elif improvement >= 0:
-                logger.info("XGBoost model slightly improved - deploying anyway")
-                self.xgb_model.save_model()
-                results["deployed"] = True
-            else:
-                logger.warning("New XGBoost model is worse - keeping old model")
-                self.xgb_model.load_model()  # Reload old model
+            # Walk-forward validation gate
+            xgb_deployed = False
+            try:
+                from ..models.walk_forward import WalkForwardValidator
+                validator = WalkForwardValidator(n_windows=4, min_accuracy=0.36)
+                from ..models.xgboost_model import XGBoostPredictor
+                passed, wf_results = validator.validate_xgboost(XGBoostPredictor, X, y)
 
-            # Train RL agent (less frequently, more expensive)
+                if passed:
+                    logger.info("Walk-forward validation PASSED - deploying XGBoost")
+                    self.xgb_model.save_model()
+                    xgb_deployed = True
+                    results["deployed"] = True
+                else:
+                    logger.warning("Walk-forward validation FAILED")
+                    if improvement >= self.min_improvement:
+                        logger.info("But accuracy improved enough - deploying anyway")
+                        self.xgb_model.save_model()
+                        xgb_deployed = True
+                        results["deployed"] = True
+                    else:
+                        logger.warning("Keeping old model")
+                        self.xgb_model.load_model()
+
+                results["walk_forward"] = wf_results
+            except Exception as e:
+                logger.warning(f"Walk-forward validation failed: {e}")
+                # Fallback to old logic
+                if improvement >= 0:
+                    self.xgb_model.save_model()
+                    xgb_deployed = True
+                    results["deployed"] = True
+                else:
+                    self.xgb_model.load_model()
+
+            # ===== TRAIN LSTM =====
+            if self.lstm_model is not None:
+                try:
+                    logger.info("Training LSTM model...")
+                    lstm_metrics = self.lstm_model.train(X, y)
+                    results["lstm_result"] = lstm_metrics
+                    logger.info(f"LSTM: val_acc={lstm_metrics.get('validation_accuracy', 0):.3f}")
+                except Exception as e:
+                    logger.error(f"LSTM training failed: {e}")
+
+            # ===== TRAIN RL AGENT =====
             if self._should_retrain_rl():
-                logger.info("Training RL agent...")
+                logger.info("Training RL agent (2M steps)...")
+
+                # Check for checkpoint to resume from
+                checkpoint_path = "models/checkpoints/rl_latest"
+                resume_from = checkpoint_path if os.path.exists(checkpoint_path + ".zip") else None
+
                 rl_metrics = self.rl_agent.train(
                     combined_df,
                     feature_cols,
-                    total_timesteps=500000
+                    total_timesteps=2000000,
+                    resume_from=resume_from
                 )
                 results["rl_result"] = rl_metrics
                 self.rl_agent.save_model()
@@ -182,11 +212,7 @@ class AutoRetrainer:
             return 0.0
 
     def _should_retrain_rl(self) -> bool:
-        """
-        Check if RL agent should be retrained.
-        RL training is expensive, so we do it less frequently.
-        """
-        # Retrain RL every 4th XGBoost retrain
+        """Check if RL agent should be retrained (every 4th retrain)."""
         return len(self.retrain_history) % 4 == 0
 
     def get_status(self) -> Dict[str, Any]:

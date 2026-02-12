@@ -1,6 +1,12 @@
 """
-Autonomous AI Trading Agent - Core Trading Logic
-=================================================
+Autonomous AI Trading Agent V2 - Core Trading Logic
+====================================================
+Integrates all V2 components:
+- TrendFilter: Block counter-trend trades
+- MarketRegimeDetector: Adjust parameters per regime
+- MetaLearnerEnsemble: 3-model voting (XGB + RL + LSTM)
+- CorrelationFilter: Block correlated same-direction positions
+- FundingRateFilter: Contrarian funding rate signals
 """
 
 import os
@@ -24,7 +30,7 @@ def run_bot(status_dict):
     """Run the trading bot. Updates status_dict for dashboard."""
 
     logger.info("=" * 50)
-    logger.info("TRADING BOT STARTING")
+    logger.info("TRADING BOT V2 STARTING")
     logger.info("=" * 50)
 
     try:
@@ -38,8 +44,13 @@ def run_bot(status_dict):
         from src.data.features import FeatureEngine
         from src.models.xgboost_model import XGBoostPredictor
         from src.models.rl_agent import RLTradingAgent
-        from src.models.ensemble import EnsembleDecider, Action
+        from src.models.lstm_model import LSTMPredictor
+        from src.models.ensemble import MetaLearnerEnsemble, Action
+        from src.models.trend_filter import TrendFilter, Trend
+        from src.models.regime_detector import MarketRegimeDetector
+        from src.models.funding_filter import FundingRateFilter
         from src.risk.manager import RiskManager, RiskLimits
+        from src.risk.correlation_filter import CorrelationFilter
         from src.autonomous.watchdog import Watchdog
         from src.autonomous.retrainer import AutoRetrainer
         from src.autonomous.health import HealthMonitor
@@ -69,20 +80,16 @@ def run_bot(status_dict):
                 okx.set_position_mode("net_mode")
                 logger.info("Position mode set to net_mode")
             except Exception as e:
-                # Error 59000 = can't change mode with open positions (already set)
                 if "59000" in str(e):
                     logger.info("Position mode already set (open positions exist) - OK")
                 else:
                     logger.error(f"Position mode setup failed: {e}")
-            # Set initial leverage per pair - skip failures (open positions may block changes)
             leverage_ok = 0
             for pair in config.futures.futures_pairs:
                 try:
                     okx.set_leverage(pair, 2, config.futures.margin_mode)
                     leverage_ok += 1
                 except Exception as e:
-                    # 59108 = can't reduce leverage with open positions (not enough margin)
-                    # This is fine - dynamic leverage will handle it per-trade
                     logger.debug(f"Leverage init skipped for {pair}: {e}")
             logger.info(f"Futures initialized: {leverage_ok}/{len(config.futures.futures_pairs)} pairs set, max {config.futures.leverage}x dynamic")
         else:
@@ -98,15 +105,33 @@ def run_bot(status_dict):
         if config.futures.enabled:
             positions.sync_futures_from_exchange(config.futures.futures_pairs)
 
+        # Load ML models
         xgb_model = XGBoostPredictor(model_path="models/xgboost_model.json")
         rl_agent = RLTradingAgent(model_path="models/rl_agent.zip")
+        lstm_model = LSTMPredictor(model_path="models/lstm_model.pt")
 
         if not xgb_model.is_trained or not rl_agent.is_trained:
             status_dict["message"] = "Training ML models (first run)..."
             logger.info("Training models...")
             initial_training(collector, features, xgb_model, rl_agent, config.trading.trading_pairs)
 
-        ensemble = EnsembleDecider(xgb_model, rl_agent, min_confidence=config.trading.min_confidence_to_trade)
+        # Initialize V2 components
+        ensemble = MetaLearnerEnsemble(
+            xgb_model, rl_agent, lstm_model,
+            min_confidence=config.trading.min_confidence_to_trade
+        )
+        trend_filter = TrendFilter(threshold=0.3)
+        regime_detector = MarketRegimeDetector()
+        funding_filter = FundingRateFilter(okx)
+        correlation_filter = CorrelationFilter(collector)
+
+        logger.info(f"V2 Components loaded:")
+        logger.info(f"  - MetaLearnerEnsemble (3-model: XGB + RL + LSTM)")
+        logger.info(f"  - TrendFilter (block counter-trend trades)")
+        logger.info(f"  - MarketRegimeDetector (adaptive parameters)")
+        logger.info(f"  - FundingRateFilter (contrarian signals)")
+        logger.info(f"  - CorrelationFilter (prevent correlated positions)")
+        logger.info(f"  - LSTM model: {'loaded' if lstm_model.is_trained else 'not trained yet'}")
 
         risk_limits = RiskLimits(
             max_position_pct=config.trading.max_position_percent,
@@ -120,12 +145,12 @@ def run_bot(status_dict):
         risk = RiskManager(positions, risk_limits)
         executor = TradeExecutor(okx, risk)
         watchdog = Watchdog(max_retries=10, retry_delay=60)
-        retrainer = AutoRetrainer(collector, features, xgb_model, rl_agent)
+        retrainer = AutoRetrainer(collector, features, xgb_model, rl_agent, lstm_model)
         health = HealthMonitor()
 
         logger.info("All components ready!")
         status_dict["state"] = "running"
-        status_dict["message"] = "Trading actively"
+        status_dict["message"] = "Trading actively (V2)"
 
         # Main loop
         cycle = 0
@@ -145,6 +170,10 @@ def run_bot(status_dict):
                     status_dict["message"] = "Trading paused (risk limit)"
                     time.sleep(3600)
                     continue
+
+                # Clear caches at start of each cycle
+                correlation_filter.clear_cache()
+                funding_filter.clear_cache()
 
                 # Check positions for stop-loss/trailing-stop/take-profit + adaptive leverage
                 for position in positions.get_all_positions():
@@ -198,7 +227,7 @@ def run_bot(status_dict):
                                 old_lev = position.leverage
                                 position.leverage = new_lev
                                 logger.info(
-                                    f"LEVERAGE ADJUSTED: {pair} {old_lev}x → {new_lev}x "
+                                    f"LEVERAGE ADJUSTED: {pair} {old_lev}x -> {new_lev}x "
                                     f"(P&L: {position.unrealized_pnl_pct:+.1f}%)"
                                 )
                             except Exception as e:
@@ -214,7 +243,7 @@ def run_bot(status_dict):
                         if len(candles_1h) < 50:
                             continue
 
-                        # Fetch higher timeframes for better context
+                        # Fetch higher timeframes
                         try:
                             candles_4h = collector.get_candles(pair, "4h", 100)
                             candles_1d = collector.get_candles(pair, "1d", 100)
@@ -228,8 +257,18 @@ def run_bot(status_dict):
                             continue
 
                         latest = df_features.iloc[[-1]]
+                        latest_row = df_features.iloc[-1]
                         price = float(candles_1h["close"].iloc[-1])
 
+                        # ===== V2: DETECT REGIME =====
+                        regime_params = regime_detector.detect_and_get_params(latest_row, df_features)
+                        logger.info(f"[{pair}] Regime: {regime_params.name} - {regime_params.description}")
+
+                        # ===== V2: GET TREND =====
+                        trend = trend_filter.get_trend(latest_row)
+                        trend_score = trend_filter._calculate_trend_score(latest_row)
+
+                        # ===== V2: 3-MODEL ENSEMBLE DECISION =====
                         portfolio_state = {
                             "balance": okx.get_usdt_balance(),
                             "position": 0,
@@ -237,19 +276,68 @@ def run_bot(status_dict):
                             "current_price": price
                         }
 
-                        decision = ensemble.get_decision(latest, portfolio_state, pair)
+                        # Get volatility for meta-features
+                        volatility = float(latest_row.get("volatility_14", 0)) if "volatility_14" in latest_row.index else 0.0
+
+                        decision = ensemble.get_decision(
+                            latest, portfolio_state, pair,
+                            regime=regime_params.name,
+                            volatility=volatility,
+                            trend_strength=trend_score
+                        )
+
+                        if decision.action == Action.HOLD:
+                            continue
+
+                        # ===== V2: TREND FILTER =====
+                        if not trend_filter.filter_decision(trend, decision.action):
+                            trend_name = trend.value.upper()
+                            action_name = "BUY" if decision.action == 1 else "SELL"
+                            logger.info(
+                                f"[{pair}] FILTERED: {action_name} blocked by {trend_name} trend "
+                                f"(score: {trend_score:.2f})"
+                            )
+                            continue
+
+                        # ===== V2: FUNDING RATE ADJUSTMENT =====
+                        adjusted_conf, funding_reason = funding_filter.adjust_decision_confidence(
+                            pair, decision.action, decision.confidence
+                        )
+                        decision.confidence = adjusted_conf
+
+                        # ===== V2: REGIME-ADJUSTED CONFIDENCE THRESHOLD =====
+                        effective_threshold = config.trading.min_confidence_to_trade + regime_params.confidence_offset
+                        if decision.confidence < effective_threshold:
+                            logger.info(
+                                f"[{pair}] Below regime threshold: {decision.confidence:.2f} < "
+                                f"{effective_threshold:.2f} ({regime_params.name})"
+                            )
+                            continue
+
+                        # ===== V2: CORRELATION FILTER =====
+                        all_positions = positions.get_all_positions()
+                        direction = 1 if decision.action == Action.BUY else -1
+                        corr_allowed, corr_reason = correlation_filter.should_allow_trade(
+                            pair, direction, all_positions
+                        )
+                        if not corr_allowed:
+                            logger.info(f"[{pair}] Correlation filter: {corr_reason}")
+                            continue
+
+                        # ===== EXECUTE TRADE =====
+                        # Apply regime position size multiplier
+                        effective_size_mult = regime_params.position_size_mult
 
                         if decision.action == Action.BUY:
                             if (config.futures.enabled
                                     and pair in config.futures.futures_pairs
                                     and not positions.has_position(pair, mode="futures")):
-                                # Futures long with dynamic leverage
                                 dyn_leverage = executor.calculate_dynamic_leverage(
                                     decision.confidence, config.futures.leverage
                                 )
                                 logger.info(
                                     f"LONG {pair} (conf: {decision.confidence:.2f}, "
-                                    f"leverage: {dyn_leverage}x)"
+                                    f"leverage: {dyn_leverage}x, regime: {regime_params.name})"
                                 )
                                 result = executor.execute_long_open(
                                     decision, price, config.futures,
@@ -269,7 +357,6 @@ def run_bot(status_dict):
                                         f"({dyn_leverage}x leverage)"
                                     )
                             else:
-                                # Spot buy fallback
                                 logger.info(f"BUY {pair} (conf: {decision.confidence:.2f})")
                                 result = executor.execute(decision, price)
                                 if result.success:
@@ -277,17 +364,15 @@ def run_bot(status_dict):
                                     logger.info(f"Bought {result.amount} {pair} @ ${result.price}")
 
                         elif decision.action == Action.SELL:
-                            # SELL signal with no spot position - open short if futures enabled
                             if (config.futures.enabled
                                     and pair in config.futures.futures_pairs
                                     and not positions.has_position(pair, mode="futures")):
-                                # Dynamic leverage based on confidence
                                 dyn_leverage = executor.calculate_dynamic_leverage(
                                     decision.confidence, config.futures.leverage
                                 )
                                 logger.info(
                                     f"SHORT {pair} (conf: {decision.confidence:.2f}, "
-                                    f"leverage: {dyn_leverage}x)"
+                                    f"leverage: {dyn_leverage}x, regime: {regime_params.name})"
                                 )
                                 result = executor.execute_short_open(
                                     decision, price, config.futures,
@@ -316,7 +401,7 @@ def run_bot(status_dict):
                 if retrainer.should_retrain():
                     status_dict["message"] = "Retraining models..."
                     retrainer.retrain_models(config.trading.trading_pairs)
-                    status_dict["message"] = "Trading actively"
+                    status_dict["message"] = "Trading actively (V2)"
 
                 status_dict["message"] = f"Cycle {cycle} done. Next in {config.trading.analysis_interval_minutes}min"
                 time.sleep(config.trading.analysis_interval_minutes * 60)

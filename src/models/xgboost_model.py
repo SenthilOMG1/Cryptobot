@@ -3,6 +3,11 @@ XGBoost Price Direction Predictor
 =================================
 Gradient boosting model that predicts if price will go UP, DOWN, or stay NEUTRAL.
 This is one of the AI brains that votes on trading decisions.
+
+V2 Upgrades:
+- Hard example mining (3x weight on misclassified samples)
+- Recency weighting (recent data matters more)
+- Persistent hard examples between retrains
 """
 
 import os
@@ -17,6 +22,8 @@ import xgboost as xgb
 
 logger = logging.getLogger(__name__)
 
+HARD_EXAMPLES_PATH = "models/hard_examples.pkl"
+
 
 class XGBoostPredictor:
     """
@@ -26,21 +33,9 @@ class XGBoostPredictor:
     - 1 (BUY): Price will go up significantly
     - -1 (SELL): Price will go down significantly
     - 0 (HOLD): Price will stay relatively flat
-
-    Features:
-    - Uses gradient boosting for robust predictions
-    - Provides confidence scores for each prediction
-    - Supports incremental training
-    - Auto-saves/loads models
     """
 
     def __init__(self, model_path: Optional[str] = None):
-        """
-        Initialize XGBoost predictor.
-
-        Args:
-            model_path: Path to load existing model (optional)
-        """
         self.model: Optional[xgb.XGBClassifier] = None
         self.feature_names: List[str] = []
         self.model_path = model_path or "models/xgboost_model.json"
@@ -52,11 +47,11 @@ class XGBoostPredictor:
             "max_depth": 6,
             "learning_rate": 0.03,
             "objective": "multi:softprob",
-            "num_class": 3,  # UP, DOWN, HOLD
+            "num_class": 3,
             "eval_metric": "mlogloss",
             "use_label_encoder": False,
             "random_state": 42,
-            "n_jobs": -1,  # Use all CPU cores
+            "n_jobs": -1,
             "min_child_weight": 5,
             "subsample": 0.8,
             "colsample_bytree": 0.7,
@@ -105,20 +100,14 @@ class XGBoostPredictor:
 
         logger.info(f"Train size: {len(X_train)}, Validation size: {len(X_val)}")
 
-        # Calculate class weights to handle imbalanced data
-        from collections import Counter
-        counts = Counter(y_train.values)
-        total = len(y_train)
-        n_classes = len(counts)
-        class_weights = {cls: total / (n_classes * count) for cls, count in counts.items()}
-        sample_weights = y_train.map(class_weights).values
+        # Compute combined sample weights (class balance + hard examples + recency)
+        sample_weights = self._compute_sample_weights(X_train, y_train)
 
         # Create model (extract early_stopping_rounds from params)
         model_params = {k: v for k, v in self.params.items() if k != "early_stopping_rounds"}
-        early_stopping = self.params.get("early_stopping_rounds", 30)
         self.model = xgb.XGBClassifier(**model_params)
 
-        # Train with class balancing and early stopping
+        # Train with combined weights and early stopping
         self.model.fit(
             X_train, y_train,
             sample_weight=sample_weights,
@@ -135,6 +124,9 @@ class XGBoostPredictor:
 
         self.is_trained = True
 
+        # Identify and save hard examples for next retrain
+        self._identify_hard_examples(X_train, y_train)
+
         metrics = {
             "train_accuracy": train_acc,
             "validation_accuracy": val_acc,
@@ -149,6 +141,68 @@ class XGBoostPredictor:
         self.save_model()
 
         return metrics
+
+    def _compute_sample_weights(self, X_train: pd.DataFrame, y_train: pd.Series) -> np.ndarray:
+        """
+        Compute combined sample weights from 3 sources:
+        1. Class balancing - inversely proportional to class frequency
+        2. Hard examples - 3x weight on previously misclassified samples
+        3. Recency - exponential decay, oldest=0.3x, newest=1.0x
+        """
+        n = len(y_train)
+
+        # 1. Class balancing weights
+        from collections import Counter
+        counts = Counter(y_train.values)
+        total = len(y_train)
+        n_classes = len(counts)
+        class_weights = {cls: total / (n_classes * count) for cls, count in counts.items()}
+        class_w = y_train.map(class_weights).values.astype(float)
+
+        # 2. Hard example weights (3x for previously misclassified)
+        hard_w = np.ones(n, dtype=float)
+        hard_indices = self._load_hard_examples()
+        if hard_indices is not None and len(hard_indices) > 0:
+            # Map hard example indices to current training set
+            valid_hard = hard_indices[hard_indices < n]
+            hard_w[valid_hard] = 3.0
+            logger.info(f"Applied 3x weight to {len(valid_hard)} hard examples")
+
+        # 3. Recency weights (exponential from 0.3 to 1.0)
+        recency_w = np.linspace(0.3, 1.0, n)
+
+        # Combine multiplicatively
+        combined = class_w * hard_w * recency_w
+
+        # Normalize to mean=1
+        combined = combined / combined.mean()
+
+        return combined
+
+    def _identify_hard_examples(self, X_train: pd.DataFrame, y_train: pd.Series):
+        """After training, predict on training set and save misclassified indices."""
+        try:
+            predictions = self.model.predict(X_train)
+            misclassified = np.where(predictions != y_train.values)[0]
+
+            os.makedirs(os.path.dirname(HARD_EXAMPLES_PATH), exist_ok=True)
+            with open(HARD_EXAMPLES_PATH, "wb") as f:
+                pickle.dump(misclassified, f)
+
+            logger.info(f"Saved {len(misclassified)} hard examples ({len(misclassified)/len(y_train)*100:.1f}% of training data)")
+        except Exception as e:
+            logger.warning(f"Failed to save hard examples: {e}")
+
+    @staticmethod
+    def _load_hard_examples() -> Optional[np.ndarray]:
+        """Load previously identified hard examples."""
+        if os.path.exists(HARD_EXAMPLES_PATH):
+            try:
+                with open(HARD_EXAMPLES_PATH, "rb") as f:
+                    return pickle.load(f)
+            except Exception:
+                pass
+        return None
 
     def predict(self, features: pd.DataFrame) -> Tuple[int, float]:
         """
@@ -167,7 +221,6 @@ class XGBoostPredictor:
 
         # Ensure correct feature order
         if isinstance(features, pd.DataFrame):
-            # Filter to only use features the model knows
             available_features = [f for f in self.feature_names if f in features.columns]
             missing_features = [f for f in self.feature_names if f not in features.columns]
 
@@ -200,12 +253,7 @@ class XGBoostPredictor:
         return predictions, confidence
 
     def predict_proba(self, features: pd.DataFrame) -> np.ndarray:
-        """
-        Get prediction probabilities for all classes.
-
-        Returns:
-            Array of shape (n_samples, 3) with probabilities for [SELL, HOLD, BUY]
-        """
+        """Get prediction probabilities for all classes."""
         if not self.is_trained or self.model is None:
             raise ValueError("Model not trained!")
 
@@ -217,15 +265,7 @@ class XGBoostPredictor:
         return self.model.predict_proba(X)
 
     def get_feature_importance(self, top_n: int = 20) -> pd.DataFrame:
-        """
-        Get feature importance rankings.
-
-        Args:
-            top_n: Number of top features to return
-
-        Returns:
-            DataFrame with feature names and importance scores
-        """
+        """Get feature importance rankings."""
         if not self.is_trained or self.model is None:
             raise ValueError("Model not trained!")
 
@@ -244,13 +284,10 @@ class XGBoostPredictor:
         if self.model is None:
             raise ValueError("No model to save!")
 
-        # Create directory if needed
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
-        # Save XGBoost model
         self.model.save_model(path)
 
-        # Save feature names separately
         meta_path = path.replace(".json", "_meta.pkl")
         with open(meta_path, "wb") as f:
             pickle.dump({
@@ -267,11 +304,9 @@ class XGBoostPredictor:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Model file not found: {path}")
 
-        # Load XGBoost model
         self.model = xgb.XGBClassifier()
         self.model.load_model(path)
 
-        # Load metadata
         meta_path = path.replace(".json", "_meta.pkl")
         if os.path.exists(meta_path):
             with open(meta_path, "rb") as f:
@@ -283,12 +318,7 @@ class XGBoostPredictor:
         logger.info(f"Model loaded from {path}")
 
     def evaluate(self, X: pd.DataFrame, y: pd.Series) -> dict:
-        """
-        Evaluate model performance.
-
-        Returns:
-            dict with accuracy and per-class metrics
-        """
+        """Evaluate model performance."""
         if not self.is_trained:
             raise ValueError("Model not trained!")
 

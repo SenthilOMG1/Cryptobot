@@ -459,6 +459,24 @@ class SecureOKXClient:
         response = self._account_api.get_positions(**params)
         return self._handle_response(response, "get_futures_positions")
 
+    # ==================== Public Data ====================
+
+    def get_funding_rate(self, pair: str) -> Dict[str, Any]:
+        """
+        Get current funding rate for a swap instrument.
+
+        Args:
+            pair: Spot pair name (e.g., 'SOL-USDT'), converted to SWAP
+
+        Returns:
+            Dict with fundingRate, nextFundingRate, fundingTime
+        """
+        self._rate_limit()
+        swap_id = self.spot_to_swap(pair)
+        response = self._public_api.get_funding_rate(instId=swap_id)
+        data = self._handle_response(response, "get_funding_rate")
+        return data[0] if data else {}
+
     # ==================== Utility ====================
 
     def test_connection(self) -> bool:
