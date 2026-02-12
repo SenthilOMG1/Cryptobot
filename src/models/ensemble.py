@@ -196,7 +196,7 @@ class EnsembleDecider:
                     rl_action=rl_action,
                     rl_confidence=rl_conf,
                     reasoning="Both models agree: SELL signal with high confidence",
-                    suggested_size_pct=100.0  # Sell entire position
+                    suggested_size_pct=self._calculate_position_size(weighted_conf)
                 )
             else:
                 return self._hold_decision(
@@ -257,19 +257,23 @@ class EnsembleDecider:
         """
         Calculate suggested position size based on confidence.
 
-        Higher confidence = larger position (within limits)
-        Range: 10% to 25% of portfolio
+        Smart money management: bet big when confident, small when unsure.
+        Combined with dynamic leverage, this controls total risk per trade.
+
+        Tiers:
+            50-55% conf → 5% of balance (minimum bet)
+            55-65% conf → 10%
+            65-75% conf → 15%
+            75%+   conf → 20% (max bet)
         """
-        min_size = 10.0
-        max_size = 25.0
-
-        # Linear scaling: 70% conf -> 10%, 100% conf -> 25%
-        confidence_range = 1.0 - self.min_confidence  # e.g., 0.3 if min is 0.7
-        scaled = (confidence - self.min_confidence) / confidence_range
-        scaled = max(0, min(1, scaled))  # Clamp to [0, 1]
-
-        size = min_size + (max_size - min_size) * scaled
-        return round(size, 1)
+        if confidence >= 0.75:
+            return 20.0
+        elif confidence >= 0.65:
+            return 15.0
+        elif confidence >= 0.55:
+            return 10.0
+        else:
+            return 5.0
 
     def update_weights(self, xgb_correct: bool, rl_correct: bool):
         """

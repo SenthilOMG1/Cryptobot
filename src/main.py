@@ -74,15 +74,17 @@ def run_bot(status_dict):
                     logger.info("Position mode already set (open positions exist) - OK")
                 else:
                     logger.error(f"Position mode setup failed: {e}")
-            try:
-                # Set initial leverage to 2x (minimum) - dynamic leverage adjusts per-trade
-                for pair in config.futures.futures_pairs:
+            # Set initial leverage per pair - skip failures (open positions may block changes)
+            leverage_ok = 0
+            for pair in config.futures.futures_pairs:
+                try:
                     okx.set_leverage(pair, 2, config.futures.margin_mode)
-                logger.info(f"Futures initialized: max {config.futures.leverage}x, dynamic leverage per-trade")
-            except Exception as e:
-                logger.error(f"Leverage setup failed: {e}")
-                logger.warning("Continuing with spot-only trading")
-                config.futures.enabled = False
+                    leverage_ok += 1
+                except Exception as e:
+                    # 59108 = can't reduce leverage with open positions (not enough margin)
+                    # This is fine - dynamic leverage will handle it per-trade
+                    logger.debug(f"Leverage init skipped for {pair}: {e}")
+            logger.info(f"Futures initialized: {leverage_ok}/{len(config.futures.futures_pairs)} pairs set, max {config.futures.leverage}x dynamic")
         else:
             logger.info("Futures trading disabled (FUTURES_ENABLED=false)")
 
@@ -238,11 +240,41 @@ def run_bot(status_dict):
                         decision = ensemble.get_decision(latest, portfolio_state, pair)
 
                         if decision.action == Action.BUY:
-                            logger.info(f"BUY {pair} (conf: {decision.confidence:.2f})")
-                            result = executor.execute(decision, price)
-                            if result.success:
-                                positions.add_position(pair, result.amount, result.price)
-                                logger.info(f"Bought {result.amount} {pair} @ ${result.price}")
+                            if (config.futures.enabled
+                                    and pair in config.futures.futures_pairs
+                                    and not positions.has_position(pair, mode="futures")):
+                                # Futures long with dynamic leverage
+                                dyn_leverage = executor.calculate_dynamic_leverage(
+                                    decision.confidence, config.futures.leverage
+                                )
+                                logger.info(
+                                    f"LONG {pair} (conf: {decision.confidence:.2f}, "
+                                    f"leverage: {dyn_leverage}x)"
+                                )
+                                result = executor.execute_long_open(
+                                    decision, price, config.futures,
+                                    dynamic_leverage=dyn_leverage
+                                )
+                                if result.success:
+                                    positions.add_position(
+                                        pair, result.amount, result.price,
+                                        side="long", mode="futures",
+                                        leverage=dyn_leverage,
+                                        max_leverage=config.futures.leverage,
+                                        entry_confidence=decision.confidence
+                                    )
+                                    risk.record_trade()
+                                    logger.info(
+                                        f"Longed {result.amount} {pair} @ ${result.price} "
+                                        f"({dyn_leverage}x leverage)"
+                                    )
+                            else:
+                                # Spot buy fallback
+                                logger.info(f"BUY {pair} (conf: {decision.confidence:.2f})")
+                                result = executor.execute(decision, price)
+                                if result.success:
+                                    positions.add_position(pair, result.amount, result.price)
+                                    logger.info(f"Bought {result.amount} {pair} @ ${result.price}")
 
                         elif decision.action == Action.SELL:
                             # SELL signal with no spot position - open short if futures enabled

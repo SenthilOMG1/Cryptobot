@@ -586,6 +586,118 @@ class TradeExecutor:
                 error=str(e)
             )
 
+    def execute_long_open(self, decision, current_price: float, futures_config, dynamic_leverage: int = None) -> TradeResult:
+        """
+        Open a leveraged long position via perpetual swap.
+
+        Args:
+            decision: TradeDecision from ensemble (action == BUY)
+            current_price: Current price of the asset
+            futures_config: FuturesConfig with leverage/margin settings
+            dynamic_leverage: Override leverage (from dynamic calculation)
+        """
+        pair = decision.pair
+        leverage = dynamic_leverage or futures_config.leverage
+
+        # Validate with risk manager
+        if not self.risk.validate_trade(decision):
+            return TradeResult(
+                success=False, order_id="", pair=pair, side="long_open",
+                amount=0, price=0, total_value=0, fee=0,
+                error="Trade rejected by risk manager"
+            )
+
+        try:
+            # Set leverage for this trade before placing order
+            try:
+                self.okx.set_leverage(pair, leverage, futures_config.margin_mode)
+                logger.info(f"Dynamic leverage set: {pair} → {leverage}x")
+            except Exception as e:
+                logger.warning(f"Failed to set leverage {leverage}x for {pair}: {e}")
+                leverage = 2  # Fallback to safe leverage
+
+            # Get available USDT balance
+            usdt_balance = self.okx.get_usdt_balance()
+
+            # Calculate trade size
+            trade_size_pct = decision.suggested_size_pct / 100
+            trade_amount_usdt = usdt_balance * trade_size_pct
+
+            # Get swap instrument info for contract sizing
+            swap_info = self.okx.get_swap_instrument_info(pair)
+            ct_val = float(swap_info.get("ctVal", 1))
+            min_sz = float(swap_info.get("minSz", 1))
+
+            # Calculate number of contracts
+            effective_usdt = trade_amount_usdt * leverage
+            num_contracts = int(effective_usdt / (ct_val * current_price))
+
+            if num_contracts < min_sz:
+                return TradeResult(
+                    success=False, order_id="", pair=pair, side="long_open",
+                    amount=0, price=current_price, total_value=trade_amount_usdt, fee=0,
+                    error=f"Calculated {num_contracts} contracts, minimum is {min_sz}"
+                )
+
+            logger.info(
+                f"Opening LONG: {pair}, {num_contracts} contracts "
+                f"(${trade_amount_usdt:.2f} margin, {leverage}x dynamic leverage, "
+                f"conf: {decision.confidence:.0%})"
+            )
+
+            # Place buy order on swap to open long
+            result = self.okx.place_futures_order(
+                pair=pair,
+                side="buy",
+                size=str(num_contracts),
+                margin_mode=futures_config.margin_mode
+            )
+
+            if result and result.get("ordId"):
+                order_id = result["ordId"]
+
+                import time
+                time.sleep(0.5)
+                swap_id = self.okx.spot_to_swap(pair)
+                order_info = self.okx.get_order(swap_id, order_id)
+
+                fill_price = float(order_info.get("avgPx", current_price))
+                fill_sz = float(order_info.get("accFillSz", num_contracts))
+                fee = float(order_info.get("fee", 0))
+
+                amount_base = fill_sz * ct_val
+
+                trade_result = TradeResult(
+                    success=True,
+                    order_id=order_id,
+                    pair=pair,
+                    side="long_open",
+                    amount=amount_base,
+                    price=fill_price,
+                    total_value=amount_base * fill_price,
+                    fee=abs(fee)
+                )
+
+                trade_result._leverage = leverage
+                trade_result._max_leverage = futures_config.leverage
+
+                self._record_trade(trade_result, decision)
+                return trade_result
+
+            return TradeResult(
+                success=False, order_id="", pair=pair, side="long_open",
+                amount=0, price=current_price, total_value=0, fee=0,
+                error="Futures order placement failed"
+            )
+
+        except Exception as e:
+            logger.error(f"Long open failed: {e}")
+            return TradeResult(
+                success=False, order_id="", pair=pair, side="long_open",
+                amount=0, price=current_price, total_value=0, fee=0,
+                error=str(e)
+            )
+
     def close_futures_position(self, pair: str, entry_price: float = 0, margin_mode: str = "cross") -> TradeResult:
         """
         Close a futures/short position.

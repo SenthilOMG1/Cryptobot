@@ -40,6 +40,8 @@ class TradingEnvironment(gym.Env):
         """
         Initialize trading environment.
 
+        Supports both LONG and SHORT positions.
+
         Args:
             df: DataFrame with OHLCV and features
             feature_columns: List of feature column names
@@ -60,20 +62,21 @@ class TradingEnvironment(gym.Env):
         if self.has_targets:
             self.targets = df['target'].values
 
-        # State space: features + [balance_ratio, position_ratio, unrealized_pnl]
-        n_features = len(feature_columns) + 3
+        # State space: features + [balance_ratio, position_ratio, unrealized_pnl, side_indicator]
+        n_features = len(feature_columns) + 4
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
             shape=(n_features,), dtype=np.float32
         )
 
-        # Action space: 0=HOLD, 1=BUY, 2=SELL
+        # Action space: 0=HOLD, 1=BUY(long), 2=SELL(short)
         self.action_space = spaces.Discrete(3)
 
         # Trading state
         self.current_step = 0
         self.balance = initial_balance
-        self.position = 0.0  # Crypto holdings
+        self.position = 0.0  # Absolute size of position
+        self.position_side = 0  # 0=flat, 1=long, -1=short
         self.entry_price = 0.0
         self.total_trades = 0
         self.winning_trades = 0
@@ -85,6 +88,7 @@ class TradingEnvironment(gym.Env):
         self.current_step = 0
         self.balance = self.initial_balance
         self.position = 0.0
+        self.position_side = 0
         self.entry_price = 0.0
         self.total_trades = 0
         self.winning_trades = 0
@@ -95,81 +99,110 @@ class TradingEnvironment(gym.Env):
         """
         Execute one trading step.
 
-        Args:
-            action: 0=HOLD, 1=BUY, 2=SELL
+        Actions:
+            0 = HOLD (do nothing)
+            1 = BUY  (open long if flat, close short if short)
+            2 = SELL (open short if flat, close long if long)
 
         Returns:
             observation, reward, terminated, truncated, info
         """
         current_price = self.df.loc[self.current_step, "close"]
 
-        # Execute action
         reward = 0.0
         trade_executed = False
 
         if action == 1:  # BUY
-            if self.balance > 0 and self.position == 0:
-                # Calculate position size
+            if self.position_side == -1:
+                # Close short position
+                pnl_pct = (self.entry_price - current_price) / self.entry_price
+                fee = self.position * current_price * self.transaction_fee
+                self.balance += self.position * self.entry_price + (pnl_pct * self.position * self.entry_price) - fee
+                reward = pnl_pct * 100
+                if pnl_pct > 0:
+                    self.winning_trades += 1
+                self.position = 0.0
+                self.position_side = 0
+                self.entry_price = 0.0
+                self.total_trades += 1
+                trade_executed = True
+            elif self.position_side == 0 and self.balance > 0:
+                # Open long position
                 trade_amount = self.balance * self.max_position_pct
                 fee = trade_amount * self.transaction_fee
-                crypto_bought = (trade_amount - fee) / current_price
-
-                self.position = crypto_bought
+                self.position = (trade_amount - fee) / current_price
                 self.balance -= trade_amount
                 self.entry_price = current_price
+                self.position_side = 1
                 self.total_trades += 1
                 trade_executed = True
 
         elif action == 2:  # SELL
-            if self.position > 0:
-                # Sell all position
+            if self.position_side == 1:
+                # Close long position
                 sale_value = self.position * current_price
                 fee = sale_value * self.transaction_fee
                 self.balance += (sale_value - fee)
-
-                # Calculate P&L for reward
                 pnl_pct = (current_price - self.entry_price) / self.entry_price
-                reward = pnl_pct * 100  # Scale reward
-
+                reward = pnl_pct * 100
                 if pnl_pct > 0:
                     self.winning_trades += 1
-
                 self.position = 0.0
+                self.position_side = 0
                 self.entry_price = 0.0
+                self.total_trades += 1
+                trade_executed = True
+            elif self.position_side == 0 and self.balance > 0:
+                # Open short position
+                trade_amount = self.balance * self.max_position_pct
+                fee = trade_amount * self.transaction_fee
+                self.position = (trade_amount - fee) / current_price
+                self.balance -= trade_amount
+                self.entry_price = current_price
+                self.position_side = -1
                 self.total_trades += 1
                 trade_executed = True
 
         # Move to next step
         self.current_step += 1
 
-        # Reward alignment with target labels (same signals XGBoost trains on)
+        # Reward alignment with target labels
         if self.has_targets and self.current_step < len(self.targets):
             target = self.targets[self.current_step - 1]
-            # action: 0=HOLD, 1=BUY, 2=SELL; target: 0=HOLD, 1=BUY, -1=SELL
-            action_map = {0: 0, 1: 1, 2: -1}  # map RL actions to target labels
+            action_map = {0: 0, 1: 1, 2: -1}
             rl_signal = action_map[int(action)]
             if rl_signal == target and target != 0:
-                reward += 0.2  # Small bonus for agreeing with direction signal
+                reward += 0.2
 
-        # Calculate unrealized P&L for holding positions
-        if self.position > 0:
-            unrealized_pnl = (current_price - self.entry_price) / self.entry_price
+        # Unrealized P&L penalty for drawdowns
+        if self.position > 0 and self.entry_price > 0:
+            if self.position_side == 1:
+                unrealized_pnl = (current_price - self.entry_price) / self.entry_price
+            else:
+                unrealized_pnl = (self.entry_price - current_price) / self.entry_price
 
-            # Penalize large drawdowns
-            if unrealized_pnl < -0.05:  # Down more than 5%
+            if unrealized_pnl < -0.05:
                 reward -= abs(unrealized_pnl) * 10
 
         # Check if episode is done
         terminated = self.current_step >= len(self.df) - 1
         truncated = False
 
-        # Portfolio value for info
-        portfolio_value = self.balance + (self.position * current_price if self.position > 0 else 0)
+        # Portfolio value
+        if self.position_side == 1:
+            pos_value = self.position * current_price
+        elif self.position_side == -1:
+            pnl = (self.entry_price - current_price) * self.position
+            pos_value = self.position * self.entry_price + pnl
+        else:
+            pos_value = 0
+        portfolio_value = self.balance + pos_value
 
         info = {
             "portfolio_value": portfolio_value,
             "balance": self.balance,
             "position": self.position,
+            "position_side": self.position_side,
             "current_price": current_price,
             "total_trades": self.total_trades,
             "trade_executed": trade_executed,
@@ -189,16 +222,29 @@ class TradingEnvironment(gym.Env):
 
         # Add portfolio state
         current_price = row["close"]
-        portfolio_value = self.balance + (self.position * current_price if self.position > 0 else 0)
+        if self.position_side == 1:
+            pos_value = self.position * current_price
+        elif self.position_side == -1:
+            pnl = (self.entry_price - current_price) * self.position
+            pos_value = self.position * self.entry_price + pnl
+        else:
+            pos_value = 0
+        portfolio_value = self.balance + pos_value
 
         balance_ratio = self.balance / self.initial_balance
-        position_ratio = (self.position * current_price) / portfolio_value if portfolio_value > 0 else 0
+        position_ratio = pos_value / portfolio_value if portfolio_value > 0 else 0
 
         unrealized_pnl = 0.0
         if self.position > 0 and self.entry_price > 0:
-            unrealized_pnl = (current_price - self.entry_price) / self.entry_price
+            if self.position_side == 1:
+                unrealized_pnl = (current_price - self.entry_price) / self.entry_price
+            else:
+                unrealized_pnl = (self.entry_price - current_price) / self.entry_price
 
-        portfolio_state = np.array([balance_ratio, position_ratio, unrealized_pnl], dtype=np.float32)
+        # Side indicator: -1=short, 0=flat, 1=long
+        side_indicator = float(self.position_side)
+
+        portfolio_state = np.array([balance_ratio, position_ratio, unrealized_pnl, side_indicator], dtype=np.float32)
 
         # Combine features and portfolio state
         observation = np.concatenate([features, portfolio_state])
@@ -375,8 +421,11 @@ class RLTradingAgent:
                 portfolio_state["current_price"] - portfolio_state["entry_price"]
             ) / portfolio_state["entry_price"]
 
+        # Side indicator: -1=short, 0=flat, 1=long
+        side_indicator = float(portfolio_state.get("side", 0))
+
         # Combine features with portfolio state
-        portfolio_features = np.array([balance_ratio, position_ratio, unrealized_pnl], dtype=np.float32)
+        portfolio_features = np.array([balance_ratio, position_ratio, unrealized_pnl, side_indicator], dtype=np.float32)
         observation = np.concatenate([features.flatten(), portfolio_features])
 
         # Handle NaN/Inf
