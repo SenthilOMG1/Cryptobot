@@ -151,7 +151,7 @@ class TradingEnvironment(gym.Env):
                 fee = self.position * current_price * self.transaction_fee
                 self.balance += self.position * self.entry_price + (pnl_pct * self.position * self.entry_price) - fee
                 trade_pnl = pnl_pct
-                reward += pnl_pct * 100  # Base P&L reward
+                reward += pnl_pct * 10  # Base P&L reward (scaled down from 100)
                 if pnl_pct > 0:
                     self.winning_trades += 1
                 self.position = 0.0
@@ -181,7 +181,7 @@ class TradingEnvironment(gym.Env):
                 self.balance += (sale_value - fee)
                 pnl_pct = (current_price - self.entry_price) / self.entry_price
                 trade_pnl = pnl_pct
-                reward += pnl_pct * 100  # Base P&L reward
+                reward += pnl_pct * 10  # Base P&L reward (scaled down from 100)
                 if pnl_pct > 0:
                     self.winning_trades += 1
                 self.position = 0.0
@@ -223,6 +223,17 @@ class TradingEnvironment(gym.Env):
         terminated = self.current_step >= len(self.df) - 1
         truncated = False
 
+        # Bankruptcy protection: end episode if lost > 50% of initial balance
+        portfolio_check = self.balance
+        if self.position_side == 1:
+            portfolio_check += self.position * current_price
+        elif self.position_side == -1:
+            pnl_check = (self.entry_price - current_price) * self.position
+            portfolio_check += self.position * self.entry_price + pnl_check
+        if portfolio_check < self.initial_balance * 0.5:
+            terminated = True
+            reward -= 5.0  # Strong penalty for blowing up
+
         # Portfolio value
         if self.position_side == 1:
             pos_value = self.position * current_price
@@ -258,15 +269,14 @@ class TradingEnvironment(gym.Env):
         """
         reward = 0.0
 
-        # 1. Trend alignment
+        # 1. Trend alignment (gentle nudge, not hard penalty)
         if self.current_step < len(self.trend_direction):
             trend = self.trend_direction[self.current_step]
             if self.position_side != 0:
-                # +0.3 for trading with trend, -0.5 for counter-trend
                 if self.position_side == trend:
-                    reward += 0.3
+                    reward += 0.15  # Small bonus for trend alignment
                 elif trend != 0 and self.position_side == -trend:
-                    reward -= 0.5
+                    reward -= 0.15  # Small penalty for counter-trend
 
         # 2. Time penalty for holding losers
         if self.position_side != 0 and self.entry_price > 0 and self.steps_in_position > 0:
@@ -275,18 +285,17 @@ class TradingEnvironment(gym.Env):
             else:
                 unrealized = (self.entry_price - current_price) / self.entry_price
 
-            if unrealized < -0.02:  # Losing > 2%
-                # Penalty increases with hold time, capped at 48 steps
+            if unrealized < -0.03:  # Losing > 3%
+                # Gentle penalty increases with hold time, capped at 48 steps
                 hold_factor = min(self.steps_in_position / 48.0, 1.0)
-                reward -= abs(unrealized) * hold_factor * 5.0
+                reward -= abs(unrealized) * hold_factor * 2.0
 
-        # 3. Overtrading penalty
+        # 3. Overtrading penalty (light touch)
         if trade_executed:
-            # Count trades in last 24 steps
             recent_count = sum(1 for step, _ in self.recent_trades
                              if self.current_step - step < 24)
-            if recent_count > 4:
-                reward -= 0.3 * (recent_count - 4)
+            if recent_count > 6:
+                reward -= 0.1 * (recent_count - 6)
 
         # 4. Sharpe bonus for consistent returns
         if len(self.episode_returns) >= 5 and trade_pnl != 0:
@@ -297,21 +306,20 @@ class TradingEnvironment(gym.Env):
                 sharpe = mean_ret / std_ret
                 reward += sharpe * 0.5  # Scale Sharpe contribution
 
-        # 5. Concentration penalty
+        # 5. Concentration penalty (very gentle)
         total_dir = self.direction_counts["long"] + self.direction_counts["short"]
-        if total_dir > 5:
+        if total_dir > 10:
             long_pct = self.direction_counts["long"] / total_dir
             short_pct = self.direction_counts["short"] / total_dir
-            if long_pct > 0.80 or short_pct > 0.80:
-                reward -= 0.3
+            if long_pct > 0.85 or short_pct > 0.85:
+                reward -= 0.1
 
-        # 6. Target alignment (from original)
-        if self.has_targets and self.current_step < len(self.targets):
-            target = self.targets[self.current_step]
-            action_map = {0: 0, 1: 1, 2: -1}
-            rl_signal = action_map[int(action)]
-            if rl_signal == target and target != 0:
-                reward += 0.2
+        # 6. Target alignment — DISABLED
+        # Previously gave +0.2 for matching labels, but this biases
+        # the RL toward whatever the label distribution is (causing SELL bias
+        # when training data has more SELL labels). RL should learn from
+        # its own P&L experience, not supervised labels.
+        pass
 
         return reward
 
@@ -362,6 +370,42 @@ class TradingEnvironment(gym.Env):
         print(f"Step {self.current_step}: Price=${current_price:.2f}, Portfolio=${portfolio_value:.2f}")
 
 
+class MultiPairTradingEnv(gym.Env):
+    """
+    Wrapper that cycles through multiple per-pair TradingEnvironments.
+
+    Each reset() picks the next pair, so the RL agent trains across
+    all pairs without catastrophic price jumps between them.
+    """
+
+    metadata = {"render_modes": ["human"]}
+
+    def __init__(self, pair_dfs: list, feature_columns: list, initial_balance: float = 1000.0):
+        super().__init__()
+        self.envs = [
+            TradingEnvironment(df=pdf, feature_columns=feature_columns, initial_balance=initial_balance)
+            for pdf in pair_dfs
+        ]
+        self.current_idx = 0
+        self.current_env = self.envs[0]
+
+        # Mirror spaces from inner env
+        self.observation_space = self.current_env.observation_space
+        self.action_space = self.current_env.action_space
+
+    def reset(self, seed=None, options=None):
+        """Reset by cycling to the next pair."""
+        self.current_idx = (self.current_idx + 1) % len(self.envs)
+        self.current_env = self.envs[self.current_idx]
+        return self.current_env.reset(seed=seed, options=options)
+
+    def step(self, action):
+        return self.current_env.step(action)
+
+    def render(self):
+        self.current_env.render()
+
+
 class RLTradingAgent:
     """
     Reinforcement Learning trading agent using PPO.
@@ -382,18 +426,18 @@ class RLTradingAgent:
 
         # PPO hyperparameters (upgraded for VPS hardware)
         self.ppo_params = {
-            "learning_rate": 0.0001,
-            "n_steps": 4096,
-            "batch_size": 128,
-            "n_epochs": 15,
+            "learning_rate": 0.0003,
+            "n_steps": 2048,
+            "batch_size": 64,
+            "n_epochs": 10,
             "gamma": 0.99,
             "gae_lambda": 0.95,
             "clip_range": 0.2,
-            "ent_coef": 0.03,
+            "ent_coef": 0.08,          # Higher entropy to prevent collapse, but not so high it goes crazy
             "vf_coef": 0.5,
             "max_grad_norm": 0.5,
             "verbose": 0,
-            "policy_kwargs": dict(net_arch=[256, 128]),
+            "policy_kwargs": dict(net_arch=[128, 64]),  # Smaller network, less overfitting
         }
 
         # Try to load existing model
@@ -411,6 +455,10 @@ class RLTradingAgent:
         """
         Train the RL agent on historical data.
 
+        If df contains a 'pair' column, splits into per-pair sub-DataFrames
+        and uses a MultiPairTradingEnv that cycles through pairs as separate
+        episodes (prevents catastrophic price jumps between pairs).
+
         Args:
             df: DataFrame with OHLCV and features
             feature_columns: List of feature column names
@@ -425,12 +473,32 @@ class RLTradingAgent:
 
         self.feature_columns = feature_columns
 
-        # Create environment
-        self.env = TradingEnvironment(
-            df=df,
-            feature_columns=feature_columns,
-            initial_balance=initial_balance
-        )
+        # Split by pair if available — prevents price-jump bug
+        if 'pair' in df.columns:
+            pair_dfs = []
+            for pair_name, pair_df in df.groupby('pair'):
+                pair_df = pair_df.sort_index().reset_index(drop=True)
+                if len(pair_df) >= 100:
+                    pair_dfs.append(pair_df)
+                    logger.info(f"  RL pair: {pair_name} ({len(pair_df)} samples)")
+            if pair_dfs:
+                logger.info(f"Training RL across {len(pair_dfs)} pairs as separate episodes")
+                self.env = MultiPairTradingEnv(
+                    pair_dfs=pair_dfs,
+                    feature_columns=feature_columns,
+                    initial_balance=initial_balance
+                )
+            else:
+                logger.warning("No valid pairs found, using combined data")
+                self.env = TradingEnvironment(
+                    df=df, feature_columns=feature_columns,
+                    initial_balance=initial_balance
+                )
+        else:
+            self.env = TradingEnvironment(
+                df=df, feature_columns=feature_columns,
+                initial_balance=initial_balance
+            )
 
         # Resume from checkpoint or create new model
         if resume_from and os.path.exists(resume_from + ".zip"):
@@ -465,8 +533,13 @@ class RLTradingAgent:
         # Save model
         self.save_model()
 
-        # Evaluate
-        metrics = self._evaluate_training(df, feature_columns, initial_balance)
+        # Evaluate on the largest pair (most representative)
+        if 'pair' in df.columns:
+            eval_pair = max(df.groupby('pair'), key=lambda x: len(x[1]))[1]
+            eval_pair = eval_pair.reset_index(drop=True)
+        else:
+            eval_pair = df
+        metrics = self._evaluate_training(eval_pair, feature_columns, initial_balance)
 
         logger.info(f"RL training complete - Final Return: {metrics['total_return']:.2%}")
 

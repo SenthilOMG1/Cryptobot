@@ -24,9 +24,9 @@ class TradingLSTM(nn.Module):
 
     def __init__(self, input_size: int, hidden_size: int = 128, num_layers: int = 2, num_classes: int = 3):
         super().__init__()
-        self.lstm1 = nn.LSTM(input_size, hidden_size, batch_first=True, dropout=0.2)
-        self.lstm2 = nn.LSTM(hidden_size, hidden_size // 2, batch_first=True, dropout=0.0)
-        self.dropout = nn.Dropout(0.3)
+        self.lstm1 = nn.LSTM(input_size, hidden_size, batch_first=True, dropout=0.3)
+        self.lstm2 = nn.LSTM(hidden_size, hidden_size // 2, batch_first=True, dropout=0.1)
+        self.dropout = nn.Dropout(0.4)
         self.fc1 = nn.Linear(hidden_size // 2, 32)
         self.relu = nn.ReLU()
         self.fc2 = nn.Linear(32, num_classes)
@@ -139,7 +139,8 @@ class LSTMPredictor:
             logger.warning(f"Too few training sequences ({len(train_dataset)}), need at least 100")
             return {"error": "Not enough data"}
 
-        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
+        # Don't shuffle - LSTM learns temporal patterns, order matters
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=False)
         val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False)
 
         # Create model

@@ -15,6 +15,8 @@ import time
 import logging
 from datetime import datetime
 
+from src.notifications import notify_trade, notify_stoploss, notify_takeprofit, notify_close, notify_alert
+
 os.makedirs("data", exist_ok=True)
 os.makedirs("models", exist_ok=True)
 
@@ -47,7 +49,7 @@ def run_bot(status_dict):
         from src.models.lstm_model import LSTMPredictor
         from src.models.ensemble import MetaLearnerEnsemble, Action
         from src.models.trend_filter import TrendFilter, Trend
-        from src.models.regime_detector import MarketRegimeDetector
+        from src.models.regime_detector import MarketRegimeDetector, MarketRegime
         from src.models.funding_filter import FundingRateFilter
         from src.risk.manager import RiskManager, RiskLimits
         from src.risk.correlation_filter import CorrelationFilter
@@ -203,16 +205,19 @@ def run_bot(status_dict):
 
                     if risk.check_stop_loss(position):
                         logger.warning(f"STOP-LOSS: {pair}{mode_label}")
+                        notify_stoploss(pair, position.side or "long", position.unrealized_pnl_pct)
                         _close_this_position()
                         continue
 
                     if risk.check_trailing_stop(position):
                         logger.info(f"TRAILING STOP: {pair}{mode_label} - locking profit")
+                        notify_close(pair, position.side or "long", position.unrealized_pnl_pct, 0, "Trailing stop")
                         _close_this_position()
                         continue
 
                     if risk.check_take_profit(position):
                         logger.info(f"TAKE-PROFIT: {pair}{mode_label}")
+                        notify_takeprofit(pair, position.side or "long", position.unrealized_pnl_pct)
                         _close_this_position()
                         continue
 
@@ -332,6 +337,7 @@ def run_bot(status_dict):
                             if (config.futures.enabled
                                     and pair in config.futures.futures_pairs
                                     and not positions.has_position(pair, mode="futures")):
+                                # Futures long — leverage maximizes gains on small capital
                                 dyn_leverage = executor.calculate_dynamic_leverage(
                                     decision.confidence, config.futures.leverage
                                 )
@@ -356,12 +362,8 @@ def run_bot(status_dict):
                                         f"Longed {result.amount} {pair} @ ${result.price} "
                                         f"({dyn_leverage}x leverage)"
                                     )
-                            else:
-                                logger.info(f"BUY {pair} (conf: {decision.confidence:.2f})")
-                                result = executor.execute(decision, price)
-                                if result.success:
-                                    positions.add_position(pair, result.amount, result.price)
-                                    logger.info(f"Bought {result.amount} {pair} @ ${result.price}")
+                                    notify_trade(pair, "BUY", "long", dyn_leverage,
+                                                 decision.confidence, result.price, result.amount * result.price)
 
                         elif decision.action == Action.SELL:
                             if (config.futures.enabled
@@ -391,6 +393,8 @@ def run_bot(status_dict):
                                         f"Shorted {result.amount} {pair} @ ${result.price} "
                                         f"({dyn_leverage}x leverage)"
                                     )
+                                    notify_trade(pair, "SELL", "short", dyn_leverage,
+                                                 decision.confidence, result.price, result.amount * result.price)
                             else:
                                 logger.debug(f"SELL signal for {pair} but no position")
 

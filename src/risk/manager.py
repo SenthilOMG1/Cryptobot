@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class RiskLimits:
     """Risk limit configuration."""
     max_position_pct: float = 25.0       # Max 25% of portfolio per position
-    stop_loss_pct: float = 3.0           # Exit if down 3%
+    stop_loss_pct: float = 5.0           # Exit if down 5%
     take_profit_pct: float = 20.0        # Exit if up 20%
     trailing_stop_pct: float = 3.0       # Trail 3% below peak price
     daily_loss_limit_pct: float = 12.0   # Pause if daily loss > 12%

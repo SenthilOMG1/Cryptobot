@@ -57,7 +57,7 @@ REGIME_PARAMS = {
         regime=MarketRegime.RANGING,
         trailing_stop_mult=0.8,    # Tighter stops - no momentum
         position_size_mult=0.8,    # Smaller positions
-        confidence_offset=0.05,    # Harder entry - ranging markets are tricky
+        confidence_offset=0.02,    # Slightly harder entry - but don't block everything
         description="Range-bound - tighter stops, smaller positions, harder entry"
     ),
     MarketRegime.HIGH_VOLATILITY: RegimeParameters(

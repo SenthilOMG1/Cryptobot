@@ -223,7 +223,7 @@ class MetaLearnerEnsemble:
         self.lstm_model = lstm_model
         self.min_confidence = min_confidence
 
-        # Default model weights for voting
+        # Equal model weights — all 3 retrained with balanced data
         self.xgb_weight = 0.35
         self.rl_weight = 0.30
         self.lstm_weight = 0.35

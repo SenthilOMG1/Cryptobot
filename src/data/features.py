@@ -438,7 +438,7 @@ class FeatureEngine:
         ]
 
 
-def create_target_labels(df: pd.DataFrame, lookahead: int = 4, threshold: float = 0.005) -> pd.Series:
+def create_target_labels(df: pd.DataFrame, lookahead: int = 6, threshold: float = 0.003) -> pd.Series:
     """
     Create target labels for ML training.
 
@@ -447,18 +447,29 @@ def create_target_labels(df: pd.DataFrame, lookahead: int = 4, threshold: float 
     - -1 (SELL): Price goes down more than threshold
     - 0 (HOLD): Price stays within threshold
 
+    Uses adaptive threshold based on recent volatility to ensure
+    balanced label distribution across different market conditions.
+
     Args:
         df: DataFrame with 'close' column
-        lookahead: How many periods ahead to look (4 = 4 hours for 1H candles)
-        threshold: Minimum price change to trigger signal (0.005 = 0.5%)
+        lookahead: How many periods ahead to look (6 = 6 hours for 1H candles)
+        threshold: Minimum price change to trigger signal (0.003 = 0.3%)
 
     Returns:
         Series with labels
     """
     future_return = df["close"].pct_change(periods=lookahead).shift(-lookahead)
 
+    # Use adaptive threshold: median absolute return scaled down
+    # This ensures roughly balanced BUY/SELL labels regardless of market regime
+    abs_returns = future_return.abs()
+    adaptive_threshold = abs_returns.rolling(window=168, min_periods=24).median() * 0.5
+    adaptive_threshold = adaptive_threshold.clip(lower=threshold, upper=0.02)
+    # Fill NaN with static threshold
+    adaptive_threshold = adaptive_threshold.fillna(threshold)
+
     labels = pd.Series(0, index=df.index)
-    labels[future_return > threshold] = 1   # BUY signal
-    labels[future_return < -threshold] = -1  # SELL signal
+    labels[future_return > adaptive_threshold] = 1   # BUY signal
+    labels[future_return < -adaptive_threshold] = -1  # SELL signal
 
     return labels

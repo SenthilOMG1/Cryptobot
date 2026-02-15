@@ -508,6 +508,11 @@ class TradeExecutor:
             trade_size_pct = decision.suggested_size_pct / 100
             trade_amount_usdt = usdt_balance * trade_size_pct
 
+            # Enforce minimum position floor of $2 margin
+            if trade_amount_usdt < 2.0:
+                trade_amount_usdt = 2.0
+                logger.info(f"Position floor applied: {pair} margin raised to $2.00")
+
             # Get swap instrument info for contract sizing
             swap_info = self.okx.get_swap_instrument_info(pair)
             ct_val = float(swap_info.get("ctVal", 1))  # Contract value (e.g. 1 SOL per contract)
@@ -517,6 +522,14 @@ class TradeExecutor:
             # With leverage, our margin buys more exposure
             effective_usdt = trade_amount_usdt * leverage
             num_contracts = int(effective_usdt / (ct_val * current_price))
+
+            # Safety: cap notional value at max_position_pct of total equity
+            notional_value = num_contracts * ct_val * current_price
+            max_notional = usdt_balance * (self.risk.limits.max_position_pct / 100) * leverage
+            if notional_value > max_notional and num_contracts > min_sz:
+                num_contracts = max(int(min_sz), int(max_notional / (ct_val * current_price)))
+                notional_value = num_contracts * ct_val * current_price
+                logger.info(f"Position capped: {pair} notional ${notional_value:.2f} (max ${max_notional:.2f})")
 
             if num_contracts < min_sz:
                 return TradeResult(
@@ -623,6 +636,11 @@ class TradeExecutor:
             trade_size_pct = decision.suggested_size_pct / 100
             trade_amount_usdt = usdt_balance * trade_size_pct
 
+            # Enforce minimum position floor of $2 margin
+            if trade_amount_usdt < 2.0:
+                trade_amount_usdt = 2.0
+                logger.info(f"Position floor applied: {pair} margin raised to $2.00")
+
             # Get swap instrument info for contract sizing
             swap_info = self.okx.get_swap_instrument_info(pair)
             ct_val = float(swap_info.get("ctVal", 1))
@@ -631,6 +649,14 @@ class TradeExecutor:
             # Calculate number of contracts
             effective_usdt = trade_amount_usdt * leverage
             num_contracts = int(effective_usdt / (ct_val * current_price))
+
+            # Safety: cap notional value at max_position_pct of total equity
+            notional_value = num_contracts * ct_val * current_price
+            max_notional = usdt_balance * (self.risk.limits.max_position_pct / 100) * leverage
+            if notional_value > max_notional and num_contracts > min_sz:
+                num_contracts = max(int(min_sz), int(max_notional / (ct_val * current_price)))
+                notional_value = num_contracts * ct_val * current_price
+                logger.info(f"Position capped: {pair} notional ${notional_value:.2f} (max ${max_notional:.2f})")
 
             if num_contracts < min_sz:
                 return TradeResult(
