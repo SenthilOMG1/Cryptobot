@@ -211,24 +211,84 @@ def _build_claude_cmd(message: str, session_id: str = None, use_continue: bool =
     return ["su", "-", "miya", "-c", shell_cmd]
 
 
-def run_claude(message: str, session_id: str = None) -> str:
-    """Run Claude Code as miya user with full permissions."""
+def _send_telegram_sync(chat_id: int, text: str):
+    """Send a Telegram message synchronously (for use in threads)."""
+    import requests as _requests
+    try:
+        _requests.post(
+            f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
+            data={'chat_id': chat_id, 'text': text},
+            timeout=10
+        )
+    except Exception:
+        pass
+
+
+def run_claude(message: str, session_id: str = None, chat_id: int = None) -> str:
+    """Run Claude Code as miya user with full permissions and live progress updates."""
     global current_session_id
+    import time as _time
+    import threading
 
     try:
         sid = session_id or current_session_id
         cmd = _build_claude_cmd(message, sid)
 
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=300,
             env={**os.environ, "TERM": "dumb", "NO_COLOR": "1"}
         )
 
-        output = result.stdout.strip()
-        stderr = result.stderr.strip()
+        output_lines = []
+        start_time = _time.time()
+        last_update_time = start_time
+        update_interval = 45  # Send progress update every 45 seconds
+        timeout = 300  # 5 minute overall timeout
+        timed_out = False
+
+        # Read output in a background thread to avoid blocking
+        def _reader():
+            for line in proc.stdout:
+                output_lines.append(line)
+
+        reader_thread = threading.Thread(target=_reader, daemon=True)
+        reader_thread.start()
+
+        while proc.poll() is None:
+            elapsed = _time.time() - start_time
+
+            # Send progress update every N seconds
+            if chat_id and (elapsed - (last_update_time - start_time)) >= update_interval:
+                last_update_time = _time.time()
+                mins = int(elapsed // 60)
+                secs = int(elapsed % 60)
+                # Grab last meaningful output line as status hint
+                hint = ""
+                for line in reversed(output_lines):
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith(("HTTP", "Warning", "  ")):
+                        hint = stripped[:100]
+                        break
+                progress_msg = f"⏳ Still working... ({mins}m {secs}s)"
+                if hint:
+                    progress_msg += f"\n> {hint}"
+                _send_telegram_sync(chat_id, progress_msg)
+
+            # Timeout check
+            if elapsed > timeout:
+                proc.kill()
+                timed_out = True
+                break
+
+            _time.sleep(1)
+
+        reader_thread.join(timeout=5)
+
+        output = "".join(output_lines).strip()
+        stderr = proc.stderr.read().strip() if proc.stderr else ""
 
         # If session not found, fall back to --continue
         if "No conversation found" in (output + stderr) and sid:
@@ -245,6 +305,11 @@ def run_claude(message: str, session_id: str = None) -> str:
             output = result.stdout.strip()
             stderr = result.stderr.strip()
 
+        if timed_out:
+            if output:
+                return f"⏰ Timed out after 5 min but here's what I got:\n\n{output}"
+            return "⏰ Timed out (5 min limit). Try a simpler request or break it into steps."
+
         if not output and stderr:
             output = f"Error: {stderr}"
         if not output:
@@ -252,8 +317,6 @@ def run_claude(message: str, session_id: str = None) -> str:
 
         return output
 
-    except subprocess.TimeoutExpired:
-        return "Timed out (5 min limit). Try a simpler request."
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -966,7 +1029,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mem0_uid = user_name.lower()
         memories = await loop.run_in_executor(None, mem0_recall, text, mem0_uid)
         prefixed = f"[Voice message from {user_name}]{memories}: {text}"
-        response = await loop.run_in_executor(None, run_claude, prefixed)
+        _chat_id = update.effective_chat.id
+        response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
 
         # Store in Mem0
         loop.run_in_executor(None, mem0_store, text, response, mem0_uid)
@@ -1015,7 +1079,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Use the Read tool to view it. Caption: \"{caption}\"]"
         )
 
-        response = await loop.run_in_executor(None, run_claude, prefixed)
+        _chat_id = update.effective_chat.id
+        response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
 
         # Store in Mem0
         loop.run_in_executor(None, mem0_store, f"[Sent photo: {caption}]", response, mem0_uid)
@@ -1049,7 +1114,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Send typing action
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    await update.message.reply_text("Thinking...")
+    await update.message.reply_text("🧠 On it...")
 
     # Recall relevant memories from Mem0
     loop = asyncio.get_event_loop()
@@ -1058,7 +1123,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Prefix message with who's talking + any memories
     prefixed = f"[Message from {user_name}]{memories}: {user_message}"
 
-    response = await loop.run_in_executor(None, run_claude, prefixed)
+    _chat_id = update.effective_chat.id
+    response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
 
     # Store conversation in Mem0 (non-blocking)
     loop.run_in_executor(None, mem0_store, user_message, response, mem0_uid)
