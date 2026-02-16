@@ -517,21 +517,32 @@ class TradeExecutor:
             swap_info = self.okx.get_swap_instrument_info(pair)
             ct_val = float(swap_info.get("ctVal", 1))  # Contract value (e.g. 1 SOL per contract)
             min_sz = float(swap_info.get("minSz", 1))  # Minimum contracts
+            lot_sz = float(swap_info.get("lotSz", 1))  # Contract step size
 
             # Calculate number of contracts
             # With leverage, our margin buys more exposure
             effective_usdt = trade_amount_usdt * leverage
-            num_contracts = int(effective_usdt / (ct_val * current_price))
+            raw_contracts = effective_usdt / (ct_val * current_price)
+            # Round down to lot size precision (supports fractional contracts like 0.02)
+            if lot_sz > 0:
+                num_contracts = round(int(raw_contracts / lot_sz) * lot_sz, 8)
+            else:
+                num_contracts = int(raw_contracts)
 
             # Safety: cap notional value at max_position_pct of total equity
             notional_value = num_contracts * ct_val * current_price
             max_notional = usdt_balance * (self.risk.limits.max_position_pct / 100) * leverage
             if notional_value > max_notional and num_contracts > min_sz:
-                num_contracts = max(int(min_sz), int(max_notional / (ct_val * current_price)))
+                capped = max_notional / (ct_val * current_price)
+                num_contracts = max(min_sz, round(int(capped / lot_sz) * lot_sz, 8))
                 notional_value = num_contracts * ct_val * current_price
                 logger.info(f"Position capped: {pair} notional ${notional_value:.2f} (max ${max_notional:.2f})")
 
             if num_contracts < min_sz:
+                logger.warning(
+                    f"[{pair}] Cannot open SHORT: {num_contracts} contracts < min {min_sz} "
+                    f"(ctVal={ct_val}, price=${current_price:.4f}, margin=${trade_amount_usdt:.2f}, {leverage}x)"
+                )
                 return TradeResult(
                     success=False, order_id="", pair=pair, side="short_open",
                     amount=0, price=current_price, total_value=trade_amount_usdt, fee=0,
@@ -545,10 +556,12 @@ class TradeExecutor:
             )
 
             # Place sell order on swap to open short
+            # Format size: integer if whole number, otherwise decimal
+            size_str = str(int(num_contracts)) if num_contracts == int(num_contracts) else f"{num_contracts:.8f}".rstrip('0')
             result = self.okx.place_futures_order(
                 pair=pair,
                 side="sell",
-                size=str(num_contracts),
+                size=size_str,
                 margin_mode=futures_config.margin_mode
             )
 
@@ -645,20 +658,31 @@ class TradeExecutor:
             swap_info = self.okx.get_swap_instrument_info(pair)
             ct_val = float(swap_info.get("ctVal", 1))
             min_sz = float(swap_info.get("minSz", 1))
+            lot_sz = float(swap_info.get("lotSz", 1))  # Contract step size
 
             # Calculate number of contracts
             effective_usdt = trade_amount_usdt * leverage
-            num_contracts = int(effective_usdt / (ct_val * current_price))
+            raw_contracts = effective_usdt / (ct_val * current_price)
+            # Round down to lot size precision (supports fractional contracts like 0.02)
+            if lot_sz > 0:
+                num_contracts = round(int(raw_contracts / lot_sz) * lot_sz, 8)
+            else:
+                num_contracts = int(raw_contracts)
 
             # Safety: cap notional value at max_position_pct of total equity
             notional_value = num_contracts * ct_val * current_price
             max_notional = usdt_balance * (self.risk.limits.max_position_pct / 100) * leverage
             if notional_value > max_notional and num_contracts > min_sz:
-                num_contracts = max(int(min_sz), int(max_notional / (ct_val * current_price)))
+                capped = max_notional / (ct_val * current_price)
+                num_contracts = max(min_sz, round(int(capped / lot_sz) * lot_sz, 8))
                 notional_value = num_contracts * ct_val * current_price
                 logger.info(f"Position capped: {pair} notional ${notional_value:.2f} (max ${max_notional:.2f})")
 
             if num_contracts < min_sz:
+                logger.warning(
+                    f"[{pair}] Cannot open LONG: {num_contracts} contracts < min {min_sz} "
+                    f"(ctVal={ct_val}, price=${current_price:.4f}, margin=${trade_amount_usdt:.2f}, {leverage}x)"
+                )
                 return TradeResult(
                     success=False, order_id="", pair=pair, side="long_open",
                     amount=0, price=current_price, total_value=trade_amount_usdt, fee=0,
@@ -672,10 +696,12 @@ class TradeExecutor:
             )
 
             # Place buy order on swap to open long
+            # Format size: integer if whole number, otherwise decimal
+            size_str = str(int(num_contracts)) if num_contracts == int(num_contracts) else f"{num_contracts:.8f}".rstrip('0')
             result = self.okx.place_futures_order(
                 pair=pair,
                 side="buy",
-                size=str(num_contracts),
+                size=size_str,
                 margin_mode=futures_config.margin_mode
             )
 
