@@ -342,8 +342,10 @@ class MetaLearnerEnsemble:
         sell_votes = sum(1 for a, c, w in models if a == Action.SELL)
 
         # Decision logic
+        # Confidence = weighted avg of AGREEING models only (not diluted by dissenter)
         if buy_score > sell_score and buy_score > hold_score and buy_votes >= 2:
-            confidence = buy_score / sum(w for _, _, w in models)
+            agreeing_weight = sum(w for a, c, w in models if a == Action.BUY)
+            confidence = buy_score / agreeing_weight if agreeing_weight > 0 else 0
             return TradeDecision(
                 action=Action.BUY, confidence=confidence,
                 xgb_action=xgb_action, xgb_confidence=xgb_conf,
@@ -355,7 +357,8 @@ class MetaLearnerEnsemble:
             )
 
         if sell_score > buy_score and sell_score > hold_score and sell_votes >= 2:
-            confidence = sell_score / sum(w for _, _, w in models)
+            agreeing_weight = sum(w for a, c, w in models if a == Action.SELL)
+            confidence = sell_score / agreeing_weight if agreeing_weight > 0 else 0
             return TradeDecision(
                 action=Action.SELL, confidence=confidence,
                 xgb_action=xgb_action, xgb_confidence=xgb_conf,

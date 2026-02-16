@@ -13,9 +13,20 @@ ENV/
 # Data & Models (will be generated)
 data/*.db
 data/*.log
+data/*.pdf
+data/*.md
+data/memes/
 models/*.json
 models/*.zip
 models/*.pkl
+models/*.pt
+models/backup/
+
+# Certs
+certs/
+
+# Bot assets
+bot_pfp.png
 
 # IDE
 .vscode/

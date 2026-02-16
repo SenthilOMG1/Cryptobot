@@ -50,7 +50,7 @@ REGIME_PARAMS = {
         regime=MarketRegime.TRENDING_DOWN,
         trailing_stop_mult=1.3,    # Wider stops for shorts too
         position_size_mult=1.2,
-        confidence_offset=-0.03,
+        confidence_offset=-0.08,   # Easier entry - downtrends are profitable for shorts
         description="Strong downtrend - wider stops, larger positions, easier entry"
     ),
     MarketRegime.RANGING: RegimeParameters(
@@ -64,8 +64,8 @@ REGIME_PARAMS = {
         regime=MarketRegime.HIGH_VOLATILITY,
         trailing_stop_mult=1.5,    # Much wider stops - volatile swings
         position_size_mult=0.5,    # Half positions - high risk
-        confidence_offset=0.10,    # Much harder entry - wild markets
-        description="High volatility - wide stops, half positions, very hard entry"
+        confidence_offset=0.03,    # Slightly harder - but don't block profitable shorts
+        description="High volatility - wide stops, half positions, slightly harder entry"
     ),
 }
 
