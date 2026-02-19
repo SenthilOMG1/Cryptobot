@@ -321,15 +321,76 @@ def run_claude(message: str, session_id: str = None, chat_id: int = None) -> str
         return f"Error: {str(e)}"
 
 
-def transcribe_voice(file_path: str) -> str:
-    """Transcribe voice message using Whisper."""
-    try:
+# Whisper model - loaded once at startup for fast transcription
+_whisper_model = None
+
+def _get_whisper_model():
+    """Load Whisper model once and cache it."""
+    global _whisper_model
+    if _whisper_model is None:
         import whisper
-        model = whisper.load_model("base")
+        logger.info("Loading Whisper base model...")
+        _whisper_model = whisper.load_model("base")
+        logger.info("Whisper model loaded!")
+    return _whisper_model
+
+
+def transcribe_voice(file_path: str) -> str:
+    """Transcribe voice/audio using cached Whisper model."""
+    try:
+        model = _get_whisper_model()
         result = model.transcribe(file_path)
         return result["text"].strip()
     except Exception as e:
         return f"[Transcription failed: {e}]"
+
+
+def extract_audio_from_video(video_path: str) -> str:
+    """Extract audio track from video using ffmpeg. Returns path to WAV file."""
+    audio_path = video_path.rsplit('.', 1)[0] + '.wav'
+    try:
+        subprocess.run(
+            ['ffmpeg', '-i', video_path, '-vn', '-acodec', 'pcm_s16le',
+             '-ar', '16000', '-ac', '1', audio_path, '-y'],
+            capture_output=True, timeout=60
+        )
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+            return audio_path
+    except Exception as e:
+        logger.error(f"Audio extraction failed: {e}")
+    return ""
+
+
+def extract_video_frames(video_path: str, max_frames: int = 4) -> list:
+    """Extract key frames from video at even intervals. Returns list of image paths."""
+    frames = []
+    try:
+        # Get video duration
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
+            capture_output=True, text=True, timeout=15
+        )
+        duration = float(probe.stdout.strip() or '0')
+        if duration <= 0:
+            return frames
+
+        # Extract frames at even intervals
+        interval = duration / (max_frames + 1)
+        for i in range(1, max_frames + 1):
+            timestamp = interval * i
+            frame_path = f"/tmp/frame_{os.getpid()}_{i}.jpg"
+            subprocess.run(
+                ['ffmpeg', '-ss', str(timestamp), '-i', video_path,
+                 '-vframes', '1', '-q:v', '2', frame_path, '-y'],
+                capture_output=True, timeout=15
+            )
+            if os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
+                os.chmod(frame_path, 0o644)
+                frames.append(frame_path)
+    except Exception as e:
+        logger.error(f"Frame extraction failed: {e}")
+    return frames
 
 
 def get_sessions(limit: int = 10) -> list:
@@ -1003,10 +1064,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Transcribing voice...")
 
     try:
-        voice = update.message.voice
+        voice = update.message.voice or update.message.audio
+        if not voice:
+            await update.message.reply_text("No audio found in message.")
+            return
         file = await context.bot.get_file(voice.file_id)
 
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+        suffix = ".ogg" if update.message.voice else ".mp3"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp_path = tmp.name
             await file.download_to_drive(tmp_path)
 
@@ -1103,6 +1168,206 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @auth
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle video/video note/animation messages - extract audio + frames, send to Claude."""
+    uid = update.effective_user.id
+    user_info = AUTHORIZED_USERS.get(uid, {})
+    user_name = user_info.get("name", "Unknown")
+    mem0_uid = user_name.lower()
+
+    await update.message.reply_text("Processing video...")
+
+    try:
+        # Get the video file (supports video, video_note, animation)
+        video = update.message.video or update.message.video_note or update.message.animation
+        if not video:
+            await update.message.reply_text("No video found.")
+            return
+
+        file = await context.bot.get_file(video.file_id)
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", dir="/tmp", delete=False) as tmp:
+            video_path = tmp.name
+            await file.download_to_drive(video_path)
+
+        os.chmod(video_path, 0o644)
+        caption = update.message.caption or ""
+        loop = asyncio.get_event_loop()
+
+        # Extract audio and transcribe
+        audio_path = await loop.run_in_executor(None, extract_audio_from_video, video_path)
+        transcript = ""
+        if audio_path:
+            transcript = await loop.run_in_executor(None, transcribe_voice, audio_path)
+            try:
+                os.unlink(audio_path)
+            except OSError:
+                pass
+
+        # Extract key frames for visual context
+        frame_paths = await loop.run_in_executor(None, extract_video_frames, video_path)
+
+        # Build the message for Claude
+        parts = []
+        if transcript and not transcript.startswith("[Transcription failed"):
+            parts.append(f"Audio transcript: \"{transcript}\"")
+            await update.message.reply_text(f"Audio: {transcript[:200]}{'...' if len(transcript) > 200 else ''}\n\nAnalyzing...")
+        else:
+            await update.message.reply_text("No audio detected. Analyzing frames...")
+
+        if frame_paths:
+            parts.append(f"Video frames saved at: {', '.join(frame_paths)} (use Read tool to view them)")
+        if caption:
+            parts.append(f"Caption: \"{caption}\"")
+
+        video_desc = ". ".join(parts) if parts else "Video had no extractable audio or frames"
+
+        # Recall memories
+        query = caption or transcript or "sent a video"
+        memories = await loop.run_in_executor(None, mem0_recall, query, mem0_uid)
+
+        prefixed = (
+            f"[Message from {user_name}]{memories}: "
+            f"[Senthil sent a video. {video_desc}]"
+        )
+
+        _chat_id = update.effective_chat.id
+        response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
+
+        # Store in Mem0
+        loop.run_in_executor(None, mem0_store, f"[Sent video: {caption or transcript[:60] or 'no caption'}]", response, mem0_uid)
+
+        await send_response(update, response)
+
+        # Clean up after delay
+        async def cleanup():
+            await asyncio.sleep(120)
+            for f in [video_path] + frame_paths:
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
+        asyncio.create_task(cleanup())
+
+    except Exception as e:
+        logger.error(f"Video handler error: {e}")
+        await update.message.reply_text(f"Error processing video: {e}")
+
+
+@auth
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle document messages - audio files, videos sent as files, etc."""
+    uid = update.effective_user.id
+    user_info = AUTHORIZED_USERS.get(uid, {})
+    user_name = user_info.get("name", "Unknown")
+    mem0_uid = user_name.lower()
+
+    doc = update.message.document
+    if not doc:
+        return
+
+    mime = doc.mime_type or ""
+    filename = doc.file_name or "unknown"
+
+    # Audio files -> transcribe
+    if mime.startswith("audio/"):
+        await update.message.reply_text(f"Transcribing {filename}...")
+        try:
+            file = await context.bot.get_file(doc.file_id)
+            suffix = os.path.splitext(filename)[1] or ".mp3"
+            with tempfile.NamedTemporaryFile(suffix=suffix, dir="/tmp", delete=False) as tmp:
+                tmp_path = tmp.name
+                await file.download_to_drive(tmp_path)
+
+            loop = asyncio.get_event_loop()
+            text = await loop.run_in_executor(None, transcribe_voice, tmp_path)
+            os.unlink(tmp_path)
+
+            if text.startswith("[Transcription failed"):
+                await update.message.reply_text(text)
+                return
+
+            await update.message.reply_text(f"Audio: {text[:200]}{'...' if len(text) > 200 else ''}\n\nProcessing...")
+
+            caption = update.message.caption or ""
+            memories = await loop.run_in_executor(None, mem0_recall, text, mem0_uid)
+            prefixed = f"[Message from {user_name}]{memories}: [Sent audio file '{filename}'. Transcript: \"{text}\"{f'. Caption: {caption}' if caption else ''}]"
+            _chat_id = update.effective_chat.id
+            response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
+            loop.run_in_executor(None, mem0_store, text, response, mem0_uid)
+            await send_response(update, response)
+            return
+        except Exception as e:
+            await update.message.reply_text(f"Audio processing error: {e}")
+            return
+
+    # Video files -> same as video handler
+    if mime.startswith("video/"):
+        await update.message.reply_text(f"Processing video {filename}...")
+        try:
+            file = await context.bot.get_file(doc.file_id)
+            suffix = os.path.splitext(filename)[1] or ".mp4"
+            with tempfile.NamedTemporaryFile(suffix=suffix, dir="/tmp", delete=False) as tmp:
+                video_path = tmp.name
+                await file.download_to_drive(video_path)
+
+            os.chmod(video_path, 0o644)
+            loop = asyncio.get_event_loop()
+
+            audio_path = await loop.run_in_executor(None, extract_audio_from_video, video_path)
+            transcript = ""
+            if audio_path:
+                transcript = await loop.run_in_executor(None, transcribe_voice, audio_path)
+                try:
+                    os.unlink(audio_path)
+                except OSError:
+                    pass
+
+            frame_paths = await loop.run_in_executor(None, extract_video_frames, video_path)
+
+            parts = []
+            if transcript and not transcript.startswith("[Transcription failed"):
+                parts.append(f"Audio transcript: \"{transcript}\"")
+            if frame_paths:
+                parts.append(f"Video frames saved at: {', '.join(frame_paths)} (use Read tool to view them)")
+
+            caption = update.message.caption or ""
+            if caption:
+                parts.append(f"Caption: \"{caption}\"")
+
+            video_desc = ". ".join(parts) if parts else "No extractable content"
+            query = caption or transcript or "sent a video"
+            memories = await loop.run_in_executor(None, mem0_recall, query, mem0_uid)
+            prefixed = f"[Message from {user_name}]{memories}: [Sent video file '{filename}'. {video_desc}]"
+            _chat_id = update.effective_chat.id
+            response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
+            loop.run_in_executor(None, mem0_store, f"[Sent video: {caption or filename}]", response, mem0_uid)
+            await send_response(update, response)
+
+            async def cleanup():
+                await asyncio.sleep(120)
+                for f in [video_path] + frame_paths:
+                    try:
+                        os.unlink(f)
+                    except OSError:
+                        pass
+            asyncio.create_task(cleanup())
+            return
+        except Exception as e:
+            await update.message.reply_text(f"Video processing error: {e}")
+            return
+
+    # Other documents - just pass filename and caption to Claude
+    caption = update.message.caption or ""
+    loop = asyncio.get_event_loop()
+    memories = await loop.run_in_executor(None, mem0_recall, caption or filename, mem0_uid)
+    prefixed = f"[Message from {user_name}]{memories}: [Sent a file: '{filename}' (type: {mime}). Caption: \"{caption}\"]"
+    _chat_id = update.effective_chat.id
+    response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
+    await send_response(update, response)
+
+
+@auth
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route text messages to Claude Code."""
     user_message = update.message.text
@@ -1173,8 +1438,16 @@ def main():
     # Voice messages
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
 
+    # Video messages (video, video notes/circles, GIFs)
+    app.add_handler(MessageHandler(
+        filters.VIDEO | filters.VIDEO_NOTE | filters.ANIMATION, handle_video
+    ))
+
     # Photo messages
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # Document messages (audio files, video files, other docs)
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     # Text messages (catch-all)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

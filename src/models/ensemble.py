@@ -325,7 +325,7 @@ class MetaLearnerEnsemble:
         lstm_action, lstm_conf,
         pair, regime
     ) -> TradeDecision:
-        """Enhanced 3-model weighted voting."""
+        """Enhanced 3-model weighted voting with directional balance."""
         models = [
             (xgb_action, xgb_conf, self.xgb_weight),
             (rl_action, rl_conf, self.rl_weight),
@@ -342,35 +342,50 @@ class MetaLearnerEnsemble:
         sell_votes = sum(1 for a, c, w in models if a == Action.SELL)
 
         # Decision logic
-        # Confidence = weighted avg of AGREEING models only (not diluted by dissenter)
-        if buy_score > sell_score and buy_score > hold_score and buy_votes >= 2:
-            agreeing_weight = sum(w for a, c, w in models if a == Action.BUY)
-            confidence = buy_score / agreeing_weight if agreeing_weight > 0 else 0
-            return TradeDecision(
-                action=Action.BUY, confidence=confidence,
-                xgb_action=xgb_action, xgb_confidence=xgb_conf,
-                rl_action=rl_action, rl_confidence=rl_conf,
-                lstm_action=lstm_action, lstm_confidence=lstm_conf,
-                reasoning=f"{buy_votes}/3 models agree: BUY",
-                pair=pair, regime=regime,
-                suggested_size_pct=self._calculate_position_size(confidence)
-            )
+        # Symmetric rules: BUY and SELL use identical thresholds
+        # 2/3 agreement = strong signal
+        # XGB+RL agreement without LSTM = still valid (LSTM has known SELL bias)
+        for action_type, action_score, action_votes, label in [
+            (Action.BUY, buy_score, buy_votes, "BUY"),
+            (Action.SELL, sell_score, sell_votes, "SELL"),
+        ]:
+            opposite_score = sell_score if action_type == Action.BUY else buy_score
+            if action_score > opposite_score and action_score > hold_score and action_votes >= 2:
+                agreeing_weight = sum(w for a, c, w in models if a == action_type)
+                confidence = action_score / agreeing_weight if agreeing_weight > 0 else 0
+                return TradeDecision(
+                    action=action_type, confidence=confidence,
+                    xgb_action=xgb_action, xgb_confidence=xgb_conf,
+                    rl_action=rl_action, rl_confidence=rl_conf,
+                    lstm_action=lstm_action, lstm_confidence=lstm_conf,
+                    reasoning=f"{action_votes}/3 models agree: {label}",
+                    pair=pair, regime=regime,
+                    suggested_size_pct=self._calculate_position_size(confidence)
+                )
 
-        if sell_score > buy_score and sell_score > hold_score and sell_votes >= 2:
-            agreeing_weight = sum(w for a, c, w in models if a == Action.SELL)
-            confidence = sell_score / agreeing_weight if agreeing_weight > 0 else 0
-            return TradeDecision(
-                action=Action.SELL, confidence=confidence,
-                xgb_action=xgb_action, xgb_confidence=xgb_conf,
-                rl_action=rl_action, rl_confidence=rl_conf,
-                lstm_action=lstm_action, lstm_confidence=lstm_conf,
-                reasoning=f"{sell_votes}/3 models agree: SELL",
-                pair=pair, regime=regime,
-                suggested_size_pct=self._calculate_position_size(confidence)
-            )
+        # XGB + RL agree but LSTM dissents (common for BUY since LSTM has SELL bias)
+        # Allow if both have decent confidence (>0.55)
+        if xgb_action == rl_action and xgb_action != Action.HOLD:
+            if xgb_conf > 0.55 and rl_conf > 0.55:
+                action_type = xgb_action
+                label = "BUY" if action_type == Action.BUY else "SELL"
+                # Use XGB+RL weighted confidence with slight penalty for missing LSTM
+                agreeing_weight = self.xgb_weight + self.rl_weight
+                raw_conf = (self.xgb_weight * xgb_conf + self.rl_weight * rl_conf) / agreeing_weight
+                confidence = raw_conf * 0.90  # 10% penalty for 2-model only
+                return TradeDecision(
+                    action=action_type, confidence=confidence,
+                    xgb_action=xgb_action, xgb_confidence=xgb_conf,
+                    rl_action=rl_action, rl_confidence=rl_conf,
+                    lstm_action=lstm_action, lstm_confidence=lstm_conf,
+                    reasoning=f"XGB+RL agree: {label} (LSTM dissent, conf penalty)",
+                    pair=pair, regime=regime,
+                    suggested_size_pct=self._calculate_position_size(confidence)
+                )
 
         # Single model high-confidence override (>80%)
-        for name, action, conf in [("XGB", xgb_action, xgb_conf), ("RL", rl_action, rl_conf), ("LSTM", lstm_action, lstm_conf)]:
+        # Exclude LSTM from solo override - it has known directional bias
+        for name, action, conf in [("XGB", xgb_action, xgb_conf), ("RL", rl_action, rl_conf)]:
             if action != Action.HOLD and conf > 0.80:
                 adj_conf = conf * 0.75  # Penalty for single model
                 return TradeDecision(

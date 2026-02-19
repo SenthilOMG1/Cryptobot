@@ -252,6 +252,194 @@ class LSTMPredictor:
         logger.info(f"LSTM training complete: val_acc={best_val_acc:.3f}")
         return metrics
 
+    def fine_tune(self, X: pd.DataFrame, y: pd.Series, freeze_early: bool = True) -> dict:
+        """
+        Incrementally fine-tune the existing LSTM model on new data.
+
+        Key differences from train():
+        - Loads existing model weights instead of creating fresh
+        - Optionally freezes early LSTM layer to prevent catastrophic forgetting
+        - Uses lower learning rate (10x lower than full train)
+        - Blends normalization stats with existing ones (EMA)
+
+        Args:
+            X: Feature DataFrame (recent data, chronologically ordered)
+            y: Target labels (1=BUY, 0=HOLD, -1=SELL)
+            freeze_early: If True, freeze lstm1 weights (only train lstm2 + FC layers)
+
+        Returns:
+            dict with training metrics
+        """
+        if not self.is_trained or self.model is None:
+            logger.warning("No existing model to fine-tune, falling back to full train")
+            return self.train(X, y)
+
+        logger.info(f"Fine-tuning LSTM on {len(X)} samples (freeze_early={freeze_early})")
+
+        # Verify feature compatibility
+        new_features = list(X.columns)
+        if new_features != self.feature_names:
+            missing = set(self.feature_names) - set(new_features)
+            extra = set(new_features) - set(self.feature_names)
+            if missing:
+                logger.warning(f"Fine-tune: {len(missing)} features missing, padding with zeros")
+                for col in missing:
+                    X = X.copy()
+                    X[col] = 0.0
+            if extra:
+                logger.info(f"Fine-tune: dropping {len(extra)} extra features")
+            X = X[self.feature_names]
+
+        features = X.values.astype(np.float32)
+
+        # Blend normalization: EMA with 70% old / 30% new
+        # This prevents distribution shift from causing the model to see "alien" inputs
+        new_mean = np.nanmean(features, axis=0)
+        new_std = np.nanstd(features, axis=0)
+        new_std[new_std == 0] = 1.0
+
+        blend_alpha = 0.3  # How much new data influences normalization
+        self.feature_mean = (1 - blend_alpha) * self.feature_mean + blend_alpha * new_mean
+        self.feature_std = (1 - blend_alpha) * self.feature_std + blend_alpha * new_std
+
+        features_norm = (features - self.feature_mean) / self.feature_std
+        features_norm = np.nan_to_num(features_norm, nan=0.0, posinf=3.0, neginf=-3.0)
+
+        # Encode labels
+        targets = y.map({-1: 0, 0: 1, 1: 2}).values.astype(np.int64)
+
+        # Chronological split
+        split_idx = int(len(features_norm) * 0.8)
+        train_features = features_norm[:split_idx]
+        train_targets = targets[:split_idx]
+        val_features = features_norm[split_idx:]
+        val_targets = targets[split_idx:]
+
+        train_dataset = TradingSequenceDataset(train_features, train_targets, self.seq_length)
+        val_dataset = TradingSequenceDataset(val_features, val_targets, self.seq_length)
+
+        if len(train_dataset) < 50:
+            logger.warning(f"Too few sequences for fine-tune ({len(train_dataset)})")
+            return {"error": "Not enough data for fine-tuning"}
+
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=False)
+        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False)
+
+        # Freeze early layers to prevent catastrophic forgetting
+        if freeze_early:
+            for param in self.model.lstm1.parameters():
+                param.requires_grad = False
+            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in self.model.parameters())
+            logger.info(f"Frozen lstm1: training {trainable}/{total_params} params ({trainable/total_params*100:.0f}%)")
+
+        # Class weights
+        from collections import Counter
+        counts = Counter(train_targets)
+        total = len(train_targets)
+        class_weights = torch.FloatTensor([
+            total / (3 * counts.get(i, 1)) for i in range(3)
+        ]).to(self.device)
+
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        # Lower LR for fine-tuning: 10x less than full train
+        fine_tune_lr = self.learning_rate * 0.1
+        optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, self.model.parameters()),
+            lr=fine_tune_lr
+        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", patience=3, factor=0.5
+        )
+
+        best_val_loss = float("inf")
+        best_val_acc = 0.0
+        patience_counter = 0
+        fine_tune_epochs = min(self.epochs, 30)  # Cap at 30 for fine-tune
+
+        for epoch in range(fine_tune_epochs):
+            self.model.train()
+            train_loss = 0.0
+            train_correct = 0
+            train_total = 0
+
+            for batch_x, batch_y in train_loader:
+                batch_x = batch_x.to(self.device)
+                batch_y = batch_y.to(self.device)
+
+                optimizer.zero_grad()
+                outputs = self.model(batch_x)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+
+                train_loss += loss.item()
+                _, predicted = torch.max(outputs, 1)
+                train_total += batch_y.size(0)
+                train_correct += (predicted == batch_y).sum().item()
+
+            self.model.eval()
+            val_loss = 0.0
+            val_correct = 0
+            val_total = 0
+
+            with torch.no_grad():
+                for batch_x, batch_y in val_loader:
+                    batch_x = batch_x.to(self.device)
+                    batch_y = batch_y.to(self.device)
+                    outputs = self.model(batch_x)
+                    loss = criterion(outputs, batch_y)
+                    val_loss += loss.item()
+                    _, predicted = torch.max(outputs, 1)
+                    val_total += batch_y.size(0)
+                    val_correct += (predicted == batch_y).sum().item()
+
+            train_acc = train_correct / max(train_total, 1)
+            val_acc = val_correct / max(val_total, 1)
+            avg_val_loss = val_loss / max(len(val_loader), 1)
+            scheduler.step(avg_val_loss)
+
+            if epoch % 5 == 0 or epoch == fine_tune_epochs - 1:
+                logger.info(
+                    f"Fine-tune Epoch {epoch+1}/{fine_tune_epochs}: "
+                    f"train_acc={train_acc:.3f}, val_acc={val_acc:.3f}, val_loss={avg_val_loss:.4f}"
+                )
+
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_val_acc = val_acc
+                patience_counter = 0
+                self._save_checkpoint()
+            else:
+                patience_counter += 1
+                if patience_counter >= 7:
+                    logger.info(f"Fine-tune early stopping at epoch {epoch+1}")
+                    self._load_checkpoint()
+                    break
+
+        # Unfreeze all layers for next time
+        if freeze_early:
+            for param in self.model.lstm1.parameters():
+                param.requires_grad = True
+
+        self.save_model()
+
+        metrics = {
+            "mode": "fine_tune",
+            "train_accuracy": train_acc,
+            "validation_accuracy": best_val_acc,
+            "best_val_loss": best_val_loss,
+            "epochs_trained": epoch + 1,
+            "train_sequences": len(train_dataset),
+            "val_sequences": len(val_dataset),
+            "learning_rate": fine_tune_lr,
+            "frozen_layers": "lstm1" if freeze_early else "none"
+        }
+
+        logger.info(f"LSTM fine-tune complete: val_acc={best_val_acc:.3f}")
+        return metrics
+
     def predict(self, features_df: pd.DataFrame) -> Tuple[int, float]:
         """
         Predict price direction using the last seq_length rows.

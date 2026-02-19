@@ -39,7 +39,8 @@ class AutoRetrainer:
         rl_agent,
         lstm_model=None,
         retrain_interval_days: int = 7,
-        min_improvement: float = 0.02
+        min_improvement: float = 0.02,
+        full_retrain_interval_days: int = 30,
     ):
         self.collector = data_collector
         self.features = feature_engine
@@ -47,9 +48,11 @@ class AutoRetrainer:
         self.rl_agent = rl_agent
         self.lstm_model = lstm_model
         self.retrain_interval = timedelta(days=retrain_interval_days)
+        self.full_retrain_interval = timedelta(days=full_retrain_interval_days)
         self.min_improvement = min_improvement
 
         self.last_retrain: Optional[datetime] = datetime.now()
+        self.last_full_retrain: Optional[datetime] = datetime.now()
         self.retrain_history: list = []
 
     def should_retrain(self) -> bool:
@@ -59,19 +62,32 @@ class AutoRetrainer:
         time_since_retrain = datetime.now() - self.last_retrain
         return time_since_retrain >= self.retrain_interval
 
+    def _is_full_retrain_due(self) -> bool:
+        """Check if monthly full retrain is due."""
+        if self.last_full_retrain is None:
+            return True
+        return datetime.now() - self.last_full_retrain >= self.full_retrain_interval
+
     def retrain_models(self, trading_pairs: list) -> Dict[str, Any]:
         """
-        Retrain all models with latest data.
+        Smart retraining: fine-tune weekly, full retrain monthly.
 
-        Pipeline:
-        1. Collect data from all pairs
-        2. Train XGBoost (with walk-forward validation gate)
-        3. Train LSTM (if available)
-        4. Train RL (every 4th retrain, 2M steps with checkpoint resume)
+        Weekly (fine-tune): Loads existing models, trains on 60 days of data
+        with low learning rates. Models build on previous knowledge.
+
+        Monthly (full retrain): Starts fresh with 180 days of data.
+        Resets all weights for a clean slate.
+
+        RL agent: Checkpoint resume every 4th retrain, full retrain monthly.
         """
-        logger.info("Starting model retraining...")
+        is_full = self._is_full_retrain_due()
+        mode = "full" if is_full else "fine_tune"
+        data_days = 180 if is_full else 60
+
+        logger.info(f"Starting model retraining (mode={mode}, data={data_days}d)...")
         results = {
             "started_at": datetime.now().isoformat(),
+            "mode": mode,
             "pairs": trading_pairs,
             "xgb_result": None,
             "lstm_result": None,
@@ -80,15 +96,15 @@ class AutoRetrainer:
         }
 
         try:
-            # Collect training data from all pairs (multi-timeframe)
+            # Collect training data
             all_data = []
             for pair in trading_pairs:
                 logger.info(f"Collecting data for {pair}...")
-                df_1h = self.collector.get_historical_data(pair, days=180, timeframe="1h")
+                df_1h = self.collector.get_historical_data(pair, days=data_days, timeframe="1h")
 
                 try:
-                    df_4h = self.collector.get_historical_data(pair, days=180, timeframe="4h")
-                    df_1d = self.collector.get_historical_data(pair, days=180, timeframe="1d")
+                    df_4h = self.collector.get_historical_data(pair, days=data_days, timeframe="4h")
+                    df_1d = self.collector.get_historical_data(pair, days=data_days, timeframe="1d")
                 except Exception:
                     df_4h, df_1d = None, None
 
@@ -103,86 +119,77 @@ class AutoRetrainer:
             combined_df = pd.concat(all_data, ignore_index=True)
             combined_df = combined_df.dropna()
 
-            logger.info(f"Training data: {len(combined_df)} samples")
+            logger.info(f"Training data: {len(combined_df)} samples ({mode} mode)")
 
             feature_cols = self.features.get_feature_names()
             X = combined_df[feature_cols]
             y = combined_df["target"]
 
-            # Store current model performance
-            old_xgb_accuracy = self._evaluate_model(self.xgb_model, X, y)
+            # ===== XGBOOST =====
+            if is_full:
+                logger.info("Full training XGBoost model...")
+                old_xgb_accuracy = self._evaluate_model(self.xgb_model, X, y)
+                xgb_metrics = self.xgb_model.train(X, y)
+                results["xgb_result"] = xgb_metrics
 
-            # ===== TRAIN XGBOOST =====
-            logger.info("Training XGBoost model...")
-            xgb_metrics = self.xgb_model.train(X, y)
-            results["xgb_result"] = xgb_metrics
+                new_xgb_accuracy = xgb_metrics["validation_accuracy"]
+                improvement = new_xgb_accuracy - old_xgb_accuracy
 
-            new_xgb_accuracy = xgb_metrics["validation_accuracy"]
-            improvement = new_xgb_accuracy - old_xgb_accuracy
+                # Walk-forward validation gate
+                try:
+                    from ..models.walk_forward import WalkForwardValidator
+                    validator = WalkForwardValidator(n_windows=4, min_accuracy=0.36)
+                    from ..models.xgboost_model import XGBoostPredictor
+                    passed, wf_results = validator.validate_xgboost(XGBoostPredictor, X, y)
 
-            logger.info(
-                f"XGBoost: Old accuracy: {old_xgb_accuracy:.3f}, "
-                f"New accuracy: {new_xgb_accuracy:.3f}, "
-                f"Improvement: {improvement:.3f}"
-            )
-
-            # Walk-forward validation gate
-            xgb_deployed = False
-            try:
-                from ..models.walk_forward import WalkForwardValidator
-                validator = WalkForwardValidator(n_windows=4, min_accuracy=0.36)
-                from ..models.xgboost_model import XGBoostPredictor
-                passed, wf_results = validator.validate_xgboost(XGBoostPredictor, X, y)
-
-                if passed:
-                    logger.info("Walk-forward validation PASSED - deploying XGBoost")
-                    self.xgb_model.save_model()
-                    xgb_deployed = True
-                    results["deployed"] = True
-                else:
-                    logger.warning("Walk-forward validation FAILED")
-                    if improvement >= self.min_improvement:
-                        logger.info("But accuracy improved enough - deploying anyway")
+                    if passed or improvement >= self.min_improvement:
                         self.xgb_model.save_model()
-                        xgb_deployed = True
                         results["deployed"] = True
                     else:
-                        logger.warning("Keeping old model")
                         self.xgb_model.load_model()
 
-                results["walk_forward"] = wf_results
-            except Exception as e:
-                logger.warning(f"Walk-forward validation failed: {e}")
-                # Fallback to old logic
-                if improvement >= 0:
-                    self.xgb_model.save_model()
-                    xgb_deployed = True
+                    results["walk_forward"] = wf_results
+                except Exception as e:
+                    logger.warning(f"Walk-forward validation failed: {e}")
+                    if improvement >= 0:
+                        self.xgb_model.save_model()
+                        results["deployed"] = True
+                    else:
+                        self.xgb_model.load_model()
+            else:
+                logger.info("Fine-tuning XGBoost model...")
+                xgb_metrics = self.xgb_model.fine_tune(X, y, n_new_trees=100)
+                results["xgb_result"] = xgb_metrics
+                if xgb_metrics.get("deployed", False):
                     results["deployed"] = True
-                else:
-                    self.xgb_model.load_model()
 
-            # ===== TRAIN LSTM =====
+            # ===== LSTM =====
             if self.lstm_model is not None:
                 try:
-                    logger.info("Training LSTM model...")
-                    lstm_metrics = self.lstm_model.train(X, y)
+                    if is_full:
+                        logger.info("Full training LSTM model...")
+                        lstm_metrics = self.lstm_model.train(X, y)
+                    else:
+                        logger.info("Fine-tuning LSTM model...")
+                        lstm_metrics = self.lstm_model.fine_tune(X, y)
                     results["lstm_result"] = lstm_metrics
-                    logger.info(f"LSTM: val_acc={lstm_metrics.get('validation_accuracy', 0):.3f}")
+                    logger.info(f"LSTM ({mode}): val_acc={lstm_metrics.get('validation_accuracy', 0):.3f}")
                 except Exception as e:
-                    logger.error(f"LSTM training failed: {e}")
+                    logger.error(f"LSTM {mode} failed: {e}")
 
-            # ===== TRAIN RL AGENT =====
-            if self._should_retrain_rl():
-                logger.info("Training RL agent (2M steps)...")
+            # ===== RL AGENT =====
+            if is_full or self._should_retrain_rl():
+                timesteps = 2000000 if is_full else 500000
+                logger.info(f"Training RL agent ({timesteps//1000}K steps)...")
 
-                # Check for checkpoint to resume from
                 checkpoint_path = "models/checkpoints/rl_latest"
-                resume_from = checkpoint_path if os.path.exists(checkpoint_path + ".zip") else None
+                resume_from = None if is_full else (
+                    checkpoint_path if os.path.exists(checkpoint_path + ".zip") else None
+                )
 
                 rl_metrics = self.rl_agent.train(
-                    combined_df,
-                    feature_cols,
-                    total_timesteps=2000000,
+                    combined_df, feature_cols,
+                    total_timesteps=timesteps,
                     resume_from=resume_from
                 )
                 results["rl_result"] = rl_metrics
@@ -190,10 +197,12 @@ class AutoRetrainer:
 
             # Update tracking
             self.last_retrain = datetime.now()
+            if is_full:
+                self.last_full_retrain = datetime.now()
             results["completed_at"] = datetime.now().isoformat()
             self.retrain_history.append(results)
 
-            logger.info("Model retraining complete!")
+            logger.info(f"Model retraining complete! (mode={mode})")
             return results
 
         except Exception as e:

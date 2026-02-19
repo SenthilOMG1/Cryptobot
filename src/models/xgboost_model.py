@@ -142,6 +142,102 @@ class XGBoostPredictor:
 
         return metrics
 
+    def fine_tune(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        test_size: float = 0.2,
+        n_new_trees: int = 100
+    ) -> dict:
+        """
+        Incrementally fine-tune the existing XGBoost model on new data.
+
+        Adds new trees on top of the existing model using XGBoost's native
+        incremental training via xgb_model parameter. The existing trees are
+        preserved and new trees learn to correct remaining errors.
+
+        Args:
+            X: Feature DataFrame (recent data)
+            y: Target labels (1=BUY, 0=HOLD, -1=SELL)
+            test_size: Fraction for validation
+            n_new_trees: Number of new boosting rounds to add
+
+        Returns:
+            dict with training metrics
+        """
+        if not self.is_trained or self.model is None:
+            logger.warning("No existing model to fine-tune, falling back to full train")
+            return self.train(X, y)
+
+        logger.info(f"Fine-tuning XGBoost on {len(X)} new samples (+{n_new_trees} trees)")
+
+        # Ensure same feature set
+        missing_cols = [c for c in self.feature_names if c not in X.columns]
+        extra_cols = [c for c in X.columns if c not in self.feature_names]
+        if missing_cols:
+            logger.warning(f"Fine-tune: {len(missing_cols)} features missing, padding with 0")
+            for col in missing_cols:
+                X = X.copy()
+                X[col] = 0.0
+        X = X[self.feature_names]
+
+        y_encoded = y.map({-1: 0, 0: 1, 1: 2})
+
+        # Chronological split
+        split_idx = int(len(X) * (1 - test_size))
+        X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_val = y_encoded.iloc[:split_idx], y_encoded.iloc[split_idx:]
+
+        logger.info(f"Fine-tune split: {len(X_train)} train, {len(X_val)} val")
+
+        sample_weights = self._compute_sample_weights(X_train, y_train)
+
+        # Use existing booster as base and add new trees
+        fine_tune_params = self.params.copy()
+        fine_tune_params["n_estimators"] = n_new_trees
+        fine_tune_params["learning_rate"] = self.params["learning_rate"] * 0.5  # Lower LR
+
+        model_params = {k: v for k, v in fine_tune_params.items() if k != "early_stopping_rounds"}
+        new_model = xgb.XGBClassifier(**model_params)
+
+        new_model.fit(
+            X_train, y_train,
+            sample_weight=sample_weights,
+            eval_set=[(X_val, y_val)],
+            xgb_model=self.model.get_booster(),
+            verbose=False
+        )
+
+        # Evaluate old vs new
+        old_val_pred = self.model.predict(X_val)
+        new_val_pred = new_model.predict(X_val)
+        old_acc = accuracy_score(y_val, old_val_pred)
+        new_acc = accuracy_score(y_val, new_val_pred)
+
+        logger.info(f"Val accuracy: {old_acc:.3f} (old) → {new_acc:.3f} (fine-tuned)")
+
+        # Only deploy if improved (or within 1% - fine-tune on new data may shift)
+        if new_acc >= old_acc - 0.01:
+            self.model = new_model
+            self.is_trained = True
+            self._identify_hard_examples(X_train, y_train)
+            self.save_model()
+            logger.info(f"Fine-tuned model deployed (acc: {new_acc:.3f})")
+            deployed = True
+        else:
+            logger.warning(f"Fine-tuned model worse ({new_acc:.3f} < {old_acc:.3f} - 0.01), keeping old")
+            deployed = False
+
+        return {
+            "mode": "fine_tune",
+            "old_val_accuracy": old_acc,
+            "new_val_accuracy": new_acc,
+            "deployed": deployed,
+            "new_trees_added": n_new_trees,
+            "train_samples": len(X_train),
+            "val_samples": len(X_val),
+        }
+
     def _compute_sample_weights(self, X_train: pd.DataFrame, y_train: pd.Series) -> np.ndarray:
         """
         Compute combined sample weights from 3 sources:

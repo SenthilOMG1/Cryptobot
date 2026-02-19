@@ -1,29 +1,22 @@
 #!/usr/bin/env python3
 """
-MOMENTUM RIDER v1.1
+MOMENTUM RIDER v2.0
 ====================
 Autonomous momentum scanner + auto-trader.
 
-Scans ALL OKX USDT pairs every 5 minutes.
-Detects pumps (>8% in 1 hour) and auto-trades them.
+v2.0 STRATEGY: Buy the DIP of the pump, not the top.
 
-Strategy:
-1. Scan all pairs → detect pumps >8% in 1hr
-2. Auto-buy $2-3 worth (futures long, isolated margin to avoid conflicts)
-3. Server-side stop loss on OKX for flash crash protection
-4. Trailing stop 5% from peak to lock profits
-5. Auto-sell on: trailing stop, -10% stop loss, 30% TP, or 2hr timeout
-6. Telegram notification for every action
+Old (v1): detect pump → buy immediately → bought the top → lost money
+New (v2): detect pump → track it → wait for pullback → confirm with volume + green candle → buy
 
-v1.1 fixes:
-- Uses ISOLATED margin to avoid conflicts with main bot's cross positions
-- Checks for existing positions before opening (no accidental cancellation)
-- Server-side stop loss order placed immediately after entry
-- Atomic state file writes to prevent corruption
-- Gets actual fill price from OKX, not stale ticker
-- Balance check before trading
-- Price cache pruning (no memory leak)
-- Scans SWAP tickers (trades on futures, should detect on futures)
+Key improvements over v1.1:
+1. DIP ENTRY: After detecting a pump, waits for a 2-3% pullback from high
+2. VOLUME CONFIRM: Requires recent volume >2x average (filters fake pumps)
+3. CANDLE CONFIRM: Waits for a green 5min candle (pump still alive after dip)
+4. PAPER MODE: Can run without placing real orders to validate strategy
+
+All v1.1 infrastructure preserved:
+- ISOLATED margin, server-side SL, atomic state, fill price, balance checks
 """
 
 import os
@@ -53,21 +46,31 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8382776877:AAH8R-Tt0r
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '7997570468')
 
 # Detection thresholds
-PUMP_THRESHOLD_1H = 8.0      # Minimum 8% gain in 1 hour to trigger
-PUMP_THRESHOLD_15M = 5.0     # Or 5% in 15 minutes (faster detection)
+PUMP_THRESHOLD_24H = 8.0     # Minimum 8% gain in 24h to consider
+PUMP_THRESHOLD_SHORT = 5.0   # Or 5% in short window (15-20min)
 MIN_VOLUME_USDT = 100000     # Minimum 24h volume to avoid illiquid coins
 MAX_CONCURRENT_RIDES = 3     # Max simultaneous momentum trades
 RIDE_AMOUNT_USDT = 3.0       # $3 per momentum trade
 MIN_BALANCE_USDT = 5.0       # Don't trade if balance below this
 
+# v2: Dip entry parameters
+DIP_ENTRY_PCT = 2.5          # Wait for 2.5% pullback from detected high before buying
+DIP_MAX_WAIT_MIN = 30        # Max time to wait for dip (abandon if no pullback)
+VOLUME_SPIKE_RATIO = 1.5     # Recent volume must be >1.5x average
+GREEN_CANDLE_REQUIRED = True # Require a green 5min candle before entry
+
+# Paper mode: set to True to run without real trades (validation mode)
+PAPER_MODE = True
+
 # Exit settings
-TRAILING_STOP_PCT = 5.0      # 5% trailing stop from peak
-STOP_LOSS_PCT = 10.0         # Hard stop at -10% price (= -30% on margin at 3x)
-MAX_HOLD_MINUTES = 120       # Auto-sell after 2 hours
-TAKE_PROFIT_PCT = 30.0       # Take profit at 30%
+TRAILING_STOP_PCT = 3.0      # 3% trailing stop from peak (tighter)
+TRAILING_ACTIVATE_PCT = 2.0  # Activate trailing stop after 2% gain
+STOP_LOSS_PCT = 5.0          # Hard stop at -5% price (= -15% on margin at 3x)
+MAX_HOLD_MINUTES = 60        # Auto-sell after 60 min
+TAKE_PROFIT_PCT = 15.0       # Take profit at 15%
 
 # Scan interval
-SCAN_INTERVAL_SECONDS = 300  # Scan every 5 minutes
+SCAN_INTERVAL_SECONDS = 120  # Scan every 2 minutes (faster to catch dips)
 
 # Cooldown: don't re-enter same coin within 2 hours
 COOLDOWN_MINUTES = 120
@@ -128,9 +131,11 @@ def send_telegram(message: str):
 def _fresh_state() -> dict:
     return {
         'active_rides': [],
+        'watchlist': [],       # v2: pumps waiting for dip entry
         'completed_rides': [],
         'cooldowns': {},
         'price_cache': {},
+        'paper_trades': [],    # v2: paper mode tracked trades
         'stats': {'total_trades': 0, 'wins': 0, 'losses': 0, 'total_pnl': 0}
     }
 
@@ -206,17 +211,25 @@ def get_all_tickers() -> list:
 
 
 def detect_pumps(tickers: list, state: dict) -> list:
-    """Detect coins pumping hard using short-term cache + 24h data."""
-    pumps = []
+    """
+    v2: Detect pumps AND dumps, add to watchlist (DON'T trade immediately).
+
+    Stage 1: Find coins with strong momentum in either direction
+      - PUMP: >8% up 24h or >5% up short-term → direction='long' (buy the dip)
+      - DUMP: >8% down 24h or >5% down short-term → direction='short' (short the bounce)
+    Stage 2 (in check_watchlist_entries): Wait for pullback + volume + candle confirm
+    """
+    new_watchlist_candidates = []
     now = time.time()
     cache = state.get('price_cache', {})
     cooldowns = state.get('cooldowns', {})
     active_symbols = {r['symbol'] for r in state.get('active_rides', [])}
+    watchlist_symbols = {w['symbol'] for w in state.get('watchlist', [])}
 
     for t in tickers:
         symbol = t['symbol']
 
-        if symbol in active_symbols:
+        if symbol in active_symbols or symbol in watchlist_symbols:
             continue
 
         # Check cooldown
@@ -237,7 +250,11 @@ def detect_pumps(tickers: list, state: dict) -> list:
         if price <= 0:
             continue
 
-        # Short-term pump detection from price cache
+        detected = False
+        direction = None  # 'long' or 'short'
+        trigger = ""
+
+        # Short-term detection from price cache
         if symbol in cache:
             cached = cache[symbol]
             cached_price = cached.get('price', 0)
@@ -246,45 +263,51 @@ def detect_pumps(tickers: list, state: dict) -> list:
 
             if cached_price > 0 and elapsed_min > 0:
                 change_pct = ((price - cached_price) / cached_price) * 100
+                if 3 <= elapsed_min <= 20:
+                    if change_pct >= PUMP_THRESHOLD_SHORT:
+                        detected = True
+                        direction = 'long'
+                        trigger = f'+{change_pct:.1f}% in {elapsed_min:.0f}min'
+                    elif change_pct <= -PUMP_THRESHOLD_SHORT:
+                        detected = True
+                        direction = 'short'
+                        trigger = f'{change_pct:.1f}% in {elapsed_min:.0f}min'
 
-                if 3 <= elapsed_min <= 20 and change_pct >= PUMP_THRESHOLD_15M:
-                    pumps.append({
-                        'symbol': symbol,
-                        'instId': t['instId'],
-                        'price': price,
-                        'change_pct': change_pct,
-                        'window_min': elapsed_min,
-                        'vol24h': t['vol24h'],
-                        'change24h': t['change24h'],
-                        'trigger': f'+{change_pct:.1f}% in {elapsed_min:.0f}min'
-                    })
-                    cache[symbol] = {'price': price, 'time': now}
-                    continue
-
-        # 24h pump detection - must be near high AND have recent momentum
-        # Require >8% 24h change AND within 3% of high (stricter than v1.0's 5%)
-        if t['change24h'] >= PUMP_THRESHOLD_1H and t['high24h'] > 0:
+        # 24h pump detection (near high = long opportunity)
+        if not detected and t['change24h'] >= PUMP_THRESHOLD_24H and t['high24h'] > 0:
             from_high = ((t['high24h'] - price) / t['high24h']) * 100
-            # Also verify short-term direction is still UP (not topping out)
-            if from_high <= 3:
-                # Extra check: if we have cached price, ensure it's still going up
-                still_rising = True
-                if symbol in cache:
-                    cached_price = cache[symbol].get('price', 0)
-                    if cached_price > 0 and price < cached_price:
-                        still_rising = False  # Price dropping from last check
+            if from_high <= 5:  # Within 5% of 24h high
+                detected = True
+                direction = 'long'
+                trigger = f'+{t["change24h"]:.1f}% 24h (near high)'
 
-                if still_rising:
-                    pumps.append({
-                        'symbol': symbol,
-                        'instId': t['instId'],
-                        'price': price,
-                        'change_pct': t['change24h'],
-                        'window_min': 0,
-                        'vol24h': t['vol24h'],
-                        'change24h': t['change24h'],
-                        'trigger': f'+{t["change24h"]:.1f}% 24h (near high, rising)'
-                    })
+        # 24h dump detection (near low = short opportunity)
+        if not detected and t['change24h'] <= -PUMP_THRESHOLD_24H and t['low24h'] > 0:
+            from_low = ((price - t['low24h']) / t['low24h']) * 100
+            if from_low <= 5:  # Within 5% of 24h low
+                detected = True
+                direction = 'short'
+                trigger = f'{t["change24h"]:.1f}% 24h (near low)'
+
+        if detected and direction:
+            candidate = {
+                'symbol': symbol,
+                'instId': t['instId'],
+                'detected_price': price,
+                'vol24h': t['vol24h'],
+                'change24h': t['change24h'],
+                'trigger': trigger,
+                'detected_at': datetime.now().isoformat(),
+                'direction': direction,
+                'status': 'watching',
+            }
+            # Track extremes: high for longs (buy dip from high), low for shorts (short bounce from low)
+            if direction == 'long':
+                candidate['high_price'] = max(price, t.get('high24h', price))
+            else:
+                candidate['low_price'] = min(price, t.get('low24h', price))
+
+            new_watchlist_candidates.append(candidate)
 
         cache[symbol] = {'price': price, 'time': now}
 
@@ -293,8 +316,154 @@ def detect_pumps(tickers: list, state: dict) -> list:
     state['price_cache'] = {k: v for k, v in cache.items() if v.get('time', 0) > cutoff}
     state['cooldowns'] = cooldowns
 
-    pumps.sort(key=lambda x: x['change_pct'], reverse=True)
-    return pumps
+    new_watchlist_candidates.sort(key=lambda x: abs(x['change24h']), reverse=True)
+    return new_watchlist_candidates
+
+
+def _get_5min_candles(inst_id: str) -> list:
+    """Fetch recent 5-minute candles for volume and candle color checks."""
+    try:
+        resp = requests.get(
+            'https://www.okx.com/api/v5/market/candles',
+            params={'instId': inst_id, 'bar': '5m', 'limit': '12'},  # Last hour
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json().get('data', [])
+            # OKX returns newest first, reverse to chronological
+            candles = []
+            for d in reversed(data):
+                candles.append({
+                    'open': float(d[1]),
+                    'high': float(d[2]),
+                    'low': float(d[3]),
+                    'close': float(d[4]),
+                    'vol': float(d[5]),
+                })
+            return candles
+    except Exception as e:
+        logger.error(f"Error fetching 5min candles for {inst_id}: {e}")
+    return []
+
+
+def check_watchlist_entries(tickers: list, state: dict) -> list:
+    """
+    v2 CORE: Check watchlist items for entry conditions (both long and short).
+
+    LONG entry (after pump detected):
+    1. Price dipped >DIP_ENTRY_PCT from high → 2. Green candle → 3. Volume spike
+
+    SHORT entry (after dump detected):
+    1. Price bounced >DIP_ENTRY_PCT from low → 2. Red candle → 3. Volume spike
+
+    Returns list of entries ready to trade.
+    """
+    ready_to_enter = []
+    ticker_map = {t['instId']: t for t in tickers}
+
+    for watch in list(state.get('watchlist', [])):
+        symbol = watch['symbol']
+        inst_id = watch['instId']
+        direction = watch.get('direction', 'long')
+
+        # Check expiry
+        try:
+            detected_at = datetime.fromisoformat(watch['detected_at'])
+            age_min = (datetime.now() - detected_at).total_seconds() / 60
+        except (ValueError, TypeError):
+            age_min = 999
+
+        if age_min > DIP_MAX_WAIT_MIN:
+            logger.info(f"Watchlist expired: {symbol} ({direction}, no entry in {DIP_MAX_WAIT_MIN}min)")
+            state['watchlist'].remove(watch)
+            continue
+
+        # Get current price
+        t = ticker_map.get(inst_id)
+        if not t:
+            continue
+
+        current_price = t['last']
+
+        if direction == 'long':
+            # LONG: track high, wait for dip
+            high_price = watch.get('high_price', current_price)
+            if current_price > high_price:
+                watch['high_price'] = current_price
+                high_price = current_price
+
+            pullback_pct = ((high_price - current_price) / high_price) * 100 if high_price > 0 else 0
+            if pullback_pct < DIP_ENTRY_PCT:
+                continue
+
+            logger.info(f"Watchlist {symbol} LONG: dipped {pullback_pct:.1f}% from high ${high_price:.6f}")
+            need_green = True  # Buy on green candle (bounce confirmation)
+
+        else:
+            # SHORT: track low, wait for bounce
+            low_price = watch.get('low_price', current_price)
+            if current_price < low_price:
+                watch['low_price'] = current_price
+                low_price = current_price
+
+            pullback_pct = ((current_price - low_price) / low_price) * 100 if low_price > 0 else 0
+            if pullback_pct < DIP_ENTRY_PCT:
+                continue
+
+            logger.info(f"Watchlist {symbol} SHORT: bounced {pullback_pct:.1f}% from low ${low_price:.6f}")
+            need_green = False  # Short on red candle (rejection confirmation)
+
+        # Check candle + volume confirmation
+        candles = _get_5min_candles(inst_id)
+        if not candles or len(candles) < 4:
+            continue
+
+        latest = candles[-1]
+        is_green = latest['close'] > latest['open']
+
+        # Candle color check: green for longs, red for shorts
+        if GREEN_CANDLE_REQUIRED:
+            if need_green and not is_green:
+                logger.debug(f"Watchlist {symbol}: dipped but candle is red, waiting for green...")
+                continue
+            if not need_green and is_green:
+                logger.debug(f"Watchlist {symbol}: bounced but candle is green, waiting for red...")
+                continue
+
+        # Volume check (same for both directions)
+        recent_vol = sum(c['vol'] for c in candles[-2:])
+        avg_vol = sum(c['vol'] for c in candles[:-2]) / max(len(candles) - 2, 1)
+        vol_ratio = recent_vol / (2 * avg_vol) if avg_vol > 0 else 0
+
+        if vol_ratio < VOLUME_SPIKE_RATIO:
+            logger.debug(f"Watchlist {symbol}: volume too low ({vol_ratio:.1f}x < {VOLUME_SPIKE_RATIO}x)")
+            continue
+
+        # ALL CONDITIONS MET
+        dir_label = "LONG" if direction == 'long' else "SHORT"
+        candle_label = "green" if is_green else "red"
+        action_label = "DIP BUY" if direction == 'long' else "BOUNCE SHORT"
+        logger.info(
+            f"ENTRY SIGNAL: {symbol} {dir_label} | pullback={pullback_pct:.1f}% | "
+            f"candle={candle_label} | vol={vol_ratio:.1f}x"
+        )
+
+        ready_to_enter.append({
+            'symbol': symbol,
+            'instId': inst_id,
+            'price': current_price,
+            'direction': direction,
+            'change_pct': watch['change24h'],
+            'vol24h': watch['vol24h'],
+            'change24h': watch['change24h'],
+            'pullback_pct': pullback_pct,
+            'vol_ratio': vol_ratio,
+            'trigger': f"{action_label}: {watch['trigger']} → pullback {pullback_pct:.1f}%, vol {vol_ratio:.1f}x",
+        })
+
+        state['watchlist'].remove(watch)
+
+    return ready_to_enter
 
 
 # ============================================================
@@ -329,10 +498,47 @@ def _get_available_balance() -> float:
 
 
 def open_momentum_trade(pump: dict, state: dict) -> bool:
-    """Open a momentum trade using ISOLATED margin to avoid conflicts."""
-    _init_okx()
+    """Open a momentum trade (long or short). Supports paper mode."""
     symbol = pump['symbol']
     swap_id = pump['instId']
+    direction = pump.get('direction', 'long')
+
+    # PAPER MODE: track what would happen without real orders
+    if PAPER_MODE:
+        paper_trade = {
+            'symbol': symbol,
+            'instId': swap_id,
+            'direction': direction,
+            'entry_price': pump['price'],
+            'peak_price': pump['price'],
+            'trough_price': pump['price'],
+            'current_price': pump['price'],
+            'contracts': 0,
+            'leverage': 3,
+            'margin_usdt': RIDE_AMOUNT_USDT,
+            'trigger': pump['trigger'],
+            'change_at_entry': pump['change_pct'],
+            'timestamp': datetime.now().isoformat(),
+            'pnl': 0,
+            'pnl_pct': 0,
+            'paper': True,
+        }
+        state['active_rides'].append(paper_trade)
+        state['stats']['total_trades'] += 1
+
+        dir_emoji = "📈" if direction == 'long' else "📉"
+        dir_label = "LONG" if direction == 'long' else "SHORT"
+        logger.info(f"PAPER {dir_label}: {symbol} @ ${pump['price']:.6f} | {pump['trigger']}")
+        send_telegram(
+            f"📝 PAPER {dir_label}: {symbol} {dir_emoji}\n"
+            f"Signal: {pump['trigger']}\n"
+            f"Entry: ${pump['price']:.6f}\n"
+            f"(Paper mode - no real order)\n"
+            f"Vol 24h: ${pump['vol24h']:,.0f}"
+        )
+        return True
+
+    _init_okx()
 
     try:
         # Check balance
@@ -381,11 +587,16 @@ def open_momentum_trade(pump: dict, state: dict) -> bool:
             logger.info(f"{symbol}: {num_contracts} contracts < min {min_sz}")
             return False
 
-        # Place market buy (open long) with ISOLATED margin
+        # Direction determines order side
+        open_side = "buy" if direction == 'long' else "sell"
+        close_side = "sell" if direction == 'long' else "buy"
+        dir_label = "LONG" if direction == 'long' else "SHORT"
+
+        # Place market order with ISOLATED margin
         result = _trade_api.place_order(
             instId=swap_id,
             tdMode="isolated",
-            side="buy",
+            side=open_side,
             ordType="market",
             sz=str(num_contracts),
             posSide="net"
@@ -393,7 +604,7 @@ def open_momentum_trade(pump: dict, state: dict) -> bool:
 
         if not (result and result.get('data') and result['data'][0].get('ordId')):
             error = result.get('data', [{}])[0].get('sMsg', 'Unknown') if result else 'No response'
-            logger.warning(f"Momentum buy failed for {symbol}: {error}")
+            logger.warning(f"Momentum {dir_label} failed for {symbol}: {error}")
             return False
 
         order_id = result['data'][0]['ordId']
@@ -410,14 +621,18 @@ def open_momentum_trade(pump: dict, state: dict) -> bool:
         except Exception:
             pass
 
-        # Place server-side stop loss on OKX (protection against flash crashes)
-        sl_price = round(actual_price * (1 - STOP_LOSS_PCT / 100), 8)
+        # Place server-side stop loss (direction-aware)
+        if direction == 'long':
+            sl_price = round(actual_price * (1 - STOP_LOSS_PCT / 100), 8)
+        else:
+            sl_price = round(actual_price * (1 + STOP_LOSS_PCT / 100), 8)
+
         sl_order_id = ""
         try:
             sl_result = _trade_api.place_algo_order(
                 instId=swap_id,
                 tdMode="isolated",
-                side="sell",
+                side=close_side,
                 ordType="conditional",
                 sz=str(num_contracts),
                 posSide="net",
@@ -426,19 +641,21 @@ def open_momentum_trade(pump: dict, state: dict) -> bool:
             )
             if sl_result and sl_result.get('data'):
                 sl_order_id = sl_result['data'][0].get('algoId', '')
-                logger.info(f"Server-side SL placed for {symbol} at ${sl_price:.6f}")
+                logger.info(f"Server-side SL placed for {symbol} {dir_label} at ${sl_price:.6f}")
         except Exception as e:
             logger.warning(f"Server SL failed for {symbol}: {e} (software SL still active)")
 
-        logger.info(f"MOMENTUM BUY: {symbol} | {num_contracts} contracts @ ${actual_price:.6f} | {pump['trigger']}")
+        logger.info(f"MOMENTUM {dir_label}: {symbol} | {num_contracts} contracts @ ${actual_price:.6f} | {pump['trigger']}")
 
         ride = {
             'symbol': symbol,
             'instId': swap_id,
+            'direction': direction,
             'order_id': order_id,
             'sl_order_id': sl_order_id,
             'entry_price': actual_price,
             'peak_price': actual_price,
+            'trough_price': actual_price,
             'current_price': actual_price,
             'contracts': num_contracts,
             'leverage': leverage,
@@ -452,14 +669,15 @@ def open_momentum_trade(pump: dict, state: dict) -> bool:
         state['active_rides'].append(ride)
         state['stats']['total_trades'] += 1
 
+        dir_emoji = "🚀" if direction == 'long' else "🔻"
         send_telegram(
-            f"🚀 MOMENTUM RIDE: {symbol}\n"
+            f"{dir_emoji} MOMENTUM {dir_label}: {symbol}\n"
             f"Signal: {pump['trigger']}\n"
             f"Entry: ${actual_price:.6f}\n"
             f"Size: {num_contracts} contracts (3x isolated)\n"
             f"Margin: ${RIDE_AMOUNT_USDT}\n"
             f"Vol 24h: ${pump['vol24h']:,.0f}\n"
-            f"Server SL: ${sl_price:.6f} (-{STOP_LOSS_PCT}%)\n"
+            f"Server SL: ${sl_price:.6f} ({STOP_LOSS_PCT}%)\n"
             f"Trail: {TRAILING_STOP_PCT}% | TP: {TAKE_PROFIT_PCT}%"
         )
         return True
@@ -470,12 +688,12 @@ def open_momentum_trade(pump: dict, state: dict) -> bool:
 
 
 def check_ride_exit(ride: dict) -> str:
-    """Check if a momentum ride should be closed."""
+    """Check if a momentum ride should be closed (works for both long and short)."""
     try:
         swap_id = ride['instId']
         entry_time = datetime.fromisoformat(ride['timestamp'])
         entry_price = ride['entry_price']
-        peak_price = ride.get('peak_price', entry_price)
+        direction = ride.get('direction', 'long')
 
         # Get current price from swap ticker
         resp = requests.get(
@@ -494,23 +712,35 @@ def check_ride_exit(ride: dict) -> str:
         current_price = float(tickers[0]['last'])
         ride['current_price'] = current_price
 
+        # Track extremes
+        peak_price = ride.get('peak_price', entry_price)
+        trough_price = ride.get('trough_price', entry_price)
         if current_price > peak_price:
             ride['peak_price'] = current_price
             peak_price = current_price
+        if current_price < trough_price:
+            ride['trough_price'] = current_price
+            trough_price = current_price
 
-        pnl_pct = ((current_price - entry_price) / entry_price) * 100
+        # P&L calculation (direction-aware)
+        if direction == 'long':
+            pnl_pct = ((current_price - entry_price) / entry_price) * 100
+            # Trailing: how far has price fallen from peak?
+            drawback_pct = ((peak_price - current_price) / peak_price) * 100 if peak_price > 0 else 0
+        else:
+            pnl_pct = ((entry_price - current_price) / entry_price) * 100
+            # Trailing: how far has price risen from trough?
+            drawback_pct = ((current_price - trough_price) / trough_price) * 100 if trough_price > 0 else 0
+
         ride['pnl_pct'] = pnl_pct
-        # PnL on margin: price_change% × leverage × margin
         ride['pnl'] = (pnl_pct / 100) * ride.get('leverage', 3) * RIDE_AMOUNT_USDT
-
-        drawdown_from_peak = ((peak_price - current_price) / peak_price) * 100 if peak_price > 0 else 0
 
         # Take profit
         if pnl_pct >= TAKE_PROFIT_PCT:
             return 'take_profit'
 
-        # Trailing stop (activate after 3% profit to avoid premature exits)
-        if pnl_pct > 3.0 and drawdown_from_peak >= TRAILING_STOP_PCT:
+        # Trailing stop (activate after TRAILING_ACTIVATE_PCT profit)
+        if pnl_pct > TRAILING_ACTIVATE_PCT and drawback_pct >= TRAILING_STOP_PCT:
             return 'trailing_stop'
 
         # Software stop loss (backup for server-side SL)
@@ -529,26 +759,80 @@ def check_ride_exit(ride: dict) -> str:
 
 
 def close_ride(ride: dict, reason: str, state: dict) -> bool:
-    """Close a momentum ride. Queries actual position size to avoid mismatches."""
+    """Close a momentum ride (long or short). Supports paper mode."""
+    direction = ride.get('direction', 'long')
+    dir_label = "LONG" if direction == 'long' else "SHORT"
+
+    # PAPER MODE: just log it
+    if ride.get('paper', False):
+        pnl_pct = ride.get('pnl_pct', 0)
+        pnl_usd = ride.get('pnl', 0)
+        icon = '🟢' if pnl_pct > 0 else '🔴'
+
+        if pnl_pct > 0:
+            state['stats']['wins'] += 1
+        else:
+            state['stats']['losses'] += 1
+        state['stats']['total_pnl'] += pnl_usd
+
+        state['cooldowns'][ride['symbol']] = (
+            datetime.now() + timedelta(minutes=COOLDOWN_MINUTES)
+        ).isoformat()
+
+        try:
+            entry_dt = datetime.fromisoformat(ride['timestamp'])
+            hold_mins = (datetime.now() - entry_dt).total_seconds() / 60
+            hold_str = f"{hold_mins:.0f}min"
+        except Exception:
+            hold_str = "?"
+
+        ride['exit_reason'] = reason
+        ride['exit_time'] = datetime.now().isoformat()
+        ride['exit_price'] = ride['current_price']
+        ride['hold_minutes'] = hold_str
+        state['completed_rides'].append(ride)
+        state['active_rides'].remove(ride)
+
+        if len(state['completed_rides']) > MAX_COMPLETED_RIDES:
+            state['completed_rides'] = state['completed_rides'][-MAX_COMPLETED_RIDES:]
+
+        stats = state['stats']
+        wr = (stats['wins'] / stats['total_trades'] * 100) if stats['total_trades'] > 0 else 0
+
+        logger.info(f"PAPER CLOSE: {ride['symbol']} {dir_label} | {reason} | PnL: {pnl_pct:+.1f}%")
+        send_telegram(
+            f"{icon} PAPER EXIT: {ride['symbol']} ({dir_label})\n"
+            f"Reason: {reason}\n"
+            f"Entry: ${ride['entry_price']:.6f}\n"
+            f"Exit: ${ride['current_price']:.6f}\n"
+            f"PnL: {pnl_pct:+.1f}% (${pnl_usd:+.2f})\n"
+            f"Hold: {hold_str}\n"
+            f"─────\n"
+            f"Stats: {stats['wins']}W/{stats['losses']}L ({wr:.0f}%) | Total: ${stats['total_pnl']:+.2f}"
+        )
+        return True
+
     _init_okx()
     try:
         swap_id = ride['instId']
+        close_side = "sell" if direction == 'long' else "buy"
 
-        # Get actual position size from exchange (not stored contracts)
+        # Get actual position size from exchange
         actual_sz = None
         try:
             pos = _acct_api.get_positions(instId=swap_id)
             if pos and pos.get('data'):
                 for p in pos['data']:
                     pos_sz = float(p.get('pos', 0))
-                    if pos_sz > 0:  # Long position
-                        actual_sz = p.get('pos', str(ride['contracts']))
+                    # Long = positive pos, Short = negative pos
+                    if (direction == 'long' and pos_sz > 0) or (direction == 'short' and pos_sz < 0):
+                        actual_sz = str(abs(pos_sz))
                         break
         except Exception:
             pass
 
         if actual_sz is None or float(actual_sz) == 0:
-            logger.warning(f"No position found for {ride['symbol']}, removing from tracking")
+            logger.warning(f"No {dir_label} position found for {ride['symbol']}, removing from tracking")
             state['active_rides'].remove(ride)
             return True
 
@@ -559,13 +843,13 @@ def close_ride(ride: dict, reason: str, state: dict) -> bool:
             except Exception:
                 pass
 
-        # Close position using actual size
+        # Close position using actual size and correct side
         result = _trade_api.place_order(
             instId=swap_id,
             tdMode="isolated",
-            side="sell",
+            side=close_side,
             ordType="market",
-            sz=str(actual_sz),
+            sz=actual_sz,
             posSide="net"
         )
 
@@ -584,7 +868,6 @@ def close_ride(ride: dict, reason: str, state: dict) -> bool:
                 datetime.now() + timedelta(minutes=COOLDOWN_MINUTES)
             ).isoformat()
 
-            # Calculate hold time
             try:
                 entry_dt = datetime.fromisoformat(ride['timestamp'])
                 hold_mins = (datetime.now() - entry_dt).total_seconds() / 60
@@ -598,17 +881,16 @@ def close_ride(ride: dict, reason: str, state: dict) -> bool:
             state['completed_rides'].append(ride)
             state['active_rides'].remove(ride)
 
-            # Prune completed rides
             if len(state['completed_rides']) > MAX_COMPLETED_RIDES:
                 state['completed_rides'] = state['completed_rides'][-MAX_COMPLETED_RIDES:]
 
             stats = state['stats']
             win_rate = (stats['wins'] / stats['total_trades'] * 100) if stats['total_trades'] > 0 else 0
 
-            logger.info(f"RIDE CLOSED: {ride['symbol']} | {reason} | PnL: {pnl_pct:+.1f}%")
+            logger.info(f"RIDE CLOSED: {ride['symbol']} {dir_label} | {reason} | PnL: {pnl_pct:+.1f}%")
 
             send_telegram(
-                f"{icon} MOMENTUM EXIT: {ride['symbol']}\n"
+                f"{icon} MOMENTUM EXIT: {ride['symbol']} ({dir_label})\n"
                 f"Reason: {reason}\n"
                 f"Entry: ${ride['entry_price']:.6f}\n"
                 f"Exit: ${ride['current_price']:.6f}\n"
@@ -651,26 +933,56 @@ def _reconcile_positions(state: dict):
 # MAIN LOOP
 # ============================================================
 def run_momentum_scanner(state: dict = None):
-    """Run one cycle of the momentum scanner."""
+    """
+    v2: Two-stage momentum scanner.
+
+    Stage 1: Detect pumps → add to watchlist
+    Stage 2: Check watchlist for dip entry conditions → trade
+    """
     if state is None:
         state = load_state()
+
+    # Ensure v2 state fields exist
+    if 'watchlist' not in state:
+        state['watchlist'] = []
+    if 'paper_trades' not in state:
+        state['paper_trades'] = []
 
     try:
         tickers = get_all_tickers()
         if not tickers:
             return state
 
-        pumps = detect_pumps(tickers, state)
+        # Build ticker lookup
+        ticker_map = {}
+        for t in tickers:
+            ticker_map[t['instId']] = t
+
+        # Stage 1: Detect new pumps/dumps → add to watchlist
+        new_candidates = detect_pumps(tickers, state)
+        for candidate in new_candidates:
+            if len(state['watchlist']) < 10:  # Cap watchlist size
+                state['watchlist'].append(candidate)
+                d = candidate.get('direction', 'long').upper()
+                action = "dip" if candidate.get('direction') == 'long' else "bounce"
+                logger.info(
+                    f"WATCHLIST +{candidate['symbol']} ({d}): {candidate['trigger']} "
+                    f"(waiting for {DIP_ENTRY_PCT}% {action})"
+                )
+
+        # Stage 2: Check watchlist for dip entry signals
+        ready_entries = check_watchlist_entries(tickers, state)
 
         active_count = len(state.get('active_rides', []))
-        for pump in pumps:
+        for entry in ready_entries:
             if active_count >= MAX_CONCURRENT_RIDES:
                 break
 
-            logger.info(f"PUMP DETECTED: {pump['symbol']} {pump['trigger']} (vol: ${pump['vol24h']:,.0f})")
-            if open_momentum_trade(pump, state):
+            logger.info(f"DIP ENTRY: {entry['symbol']} {entry['trigger']}")
+            if open_momentum_trade(entry, state):
                 active_count += 1
 
+        # Check active rides for exit
         for ride in list(state.get('active_rides', [])):
             action = check_ride_exit(ride)
             if action != 'hold':
@@ -686,29 +998,35 @@ def run_momentum_scanner(state: dict = None):
 
 def main():
     """Standalone momentum rider loop."""
+    mode_str = "PAPER MODE" if PAPER_MODE else "LIVE"
     logger.info("=" * 50)
-    logger.info("MOMENTUM RIDER v1.1 STARTING")
+    logger.info(f"MOMENTUM RIDER v2.0 STARTING ({mode_str})")
     logger.info("=" * 50)
-    logger.info(f"Pump threshold: >{PUMP_THRESHOLD_1H}% (1h) or >{PUMP_THRESHOLD_15M}% (15m)")
+    logger.info(f"Strategy: Detect pump → watchlist → wait for {DIP_ENTRY_PCT}% dip → confirm → enter")
+    logger.info(f"Pump threshold: >{PUMP_THRESHOLD_24H}% (24h) or >{PUMP_THRESHOLD_SHORT}% (short)")
+    logger.info(f"Entry: dip {DIP_ENTRY_PCT}% + vol {VOLUME_SPIKE_RATIO}x + green candle={GREEN_CANDLE_REQUIRED}")
     logger.info(f"Ride size: ${RIDE_AMOUNT_USDT} @ 3x ISOLATED leverage")
     logger.info(f"Max concurrent: {MAX_CONCURRENT_RIDES}")
     logger.info(f"Trailing stop: {TRAILING_STOP_PCT}% | SL: {STOP_LOSS_PCT}% | TP: {TAKE_PROFIT_PCT}%")
     logger.info(f"Excluded pairs (main bot): {MAIN_BOT_PAIRS}")
 
-    _init_okx()
+    if not PAPER_MODE:
+        _init_okx()
 
     state = load_state()
 
-    # Reconcile: check active rides have real positions
-    _reconcile_positions(state)
+    # Reset v1 state if upgrading
+    if state.get('active_rides') and not PAPER_MODE:
+        _reconcile_positions(state)
 
     send_telegram(
-        f"🏄 Momentum Rider v1.1 ACTIVE\n"
-        f"Scanning ALL OKX pairs every {SCAN_INTERVAL_SECONDS // 60}min\n"
-        f"Trigger: >{PUMP_THRESHOLD_1H}% (1h) or >{PUMP_THRESHOLD_15M}% (15m)\n"
-        f"Ride size: ${RIDE_AMOUNT_USDT} @ 3x isolated\n"
+        f"🏄 Momentum Rider v2.0 ({mode_str})\n"
+        f"Strategy: dip-buy (wait for pullback)\n"
+        f"Scan: every {SCAN_INTERVAL_SECONDS // 60}min\n"
+        f"Detect: >{PUMP_THRESHOLD_24H}% 24h or >{PUMP_THRESHOLD_SHORT}% short\n"
+        f"Entry: {DIP_ENTRY_PCT}% dip + {VOLUME_SPIKE_RATIO}x vol + green candle\n"
+        f"Ride: ${RIDE_AMOUNT_USDT} @ 3x | SL: {STOP_LOSS_PCT}% | Trail: {TRAILING_STOP_PCT}% | TP: {TAKE_PROFIT_PCT}%\n"
         f"Max rides: {MAX_CONCURRENT_RIDES}\n"
-        f"Server SL: {STOP_LOSS_PCT}% | Trail: {TRAILING_STOP_PCT}% | TP: {TAKE_PROFIT_PCT}%\n"
         f"Excluded: {', '.join(sorted(MAIN_BOT_PAIRS))}"
     )
 
@@ -719,11 +1037,13 @@ def main():
             cycle += 1
             state = run_momentum_scanner(state)
 
+            # Status log every ~24 min (12 cycles × 2 min)
             if cycle % 12 == 0:
                 active = len(state.get('active_rides', []))
+                watching = len(state.get('watchlist', []))
                 stats = state.get('stats', {})
                 logger.info(
-                    f"Momentum status: {active} active | "
+                    f"Momentum v2: {active} active | {watching} watching | "
                     f"{stats.get('total_trades', 0)} trades | "
                     f"${stats.get('total_pnl', 0):+.2f} total PnL"
                 )
@@ -732,7 +1052,7 @@ def main():
 
         except KeyboardInterrupt:
             logger.info("Momentum rider stopped")
-            send_telegram("🛑 Momentum Rider stopped")
+            send_telegram("🛑 Momentum Rider v2.0 stopped")
             save_state(state)
             break
         except Exception as e:
