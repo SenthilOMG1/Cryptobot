@@ -306,13 +306,17 @@ class TradingEnvironment(gym.Env):
                 sharpe = mean_ret / std_ret
                 reward += sharpe * 0.5  # Scale Sharpe contribution
 
-        # 5. Concentration penalty (very gentle)
+        # 5. Concentration penalty (progressive)
+        # Stronger penalty that scales with imbalance to prevent one-directional trading
         total_dir = self.direction_counts["long"] + self.direction_counts["short"]
-        if total_dir > 10:
+        if total_dir > 6:
             long_pct = self.direction_counts["long"] / total_dir
             short_pct = self.direction_counts["short"] / total_dir
-            if long_pct > 0.85 or short_pct > 0.85:
-                reward -= 0.1
+            dominant_pct = max(long_pct, short_pct)
+            if dominant_pct > 0.70:
+                # Progressive: 0.2 at 70%, 0.5 at 85%, 1.0 at 100%
+                penalty = (dominant_pct - 0.70) * 3.3
+                reward -= penalty
 
         # 6. Target alignment — DISABLED
         # Previously gave +0.2 for matching labels, but this biases

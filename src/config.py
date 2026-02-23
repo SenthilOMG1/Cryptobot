@@ -172,13 +172,13 @@ class Config:
             raise ValueError("take_profit_percent must be between 0 and 100")
 
         # Validate confidence thresholds
-        if not (0.5 <= self.trading.min_confidence_to_trade <= 1.0):
-            raise ValueError("min_confidence_to_trade must be between 0.5 and 1.0")
+        if not (0.3 <= self.trading.min_confidence_to_trade <= 1.0):
+            raise ValueError("min_confidence_to_trade must be between 0.3 and 1.0")
 
         # Validate futures config
         if self.futures.enabled:
-            if not (1 <= self.futures.leverage <= 7):
-                raise ValueError("futures leverage must be between 1 and 7 (safety limit)")
+            if not (1 <= self.futures.leverage <= 20):
+                raise ValueError("futures leverage must be between 1 and 20")
             if self.futures.margin_mode not in ("cross", "isolated"):
                 raise ValueError("futures margin_mode must be 'cross' or 'isolated'")
             if not self.futures.futures_pairs:

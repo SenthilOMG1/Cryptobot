@@ -6,8 +6,10 @@ These features are what the AI learns patterns from.
 """
 
 import logging
+import time
 import numpy as np
 import pandas as pd
+import requests
 from ta import add_all_ta_features
 from ta.trend import SMAIndicator, EMAIndicator, MACD, ADXIndicator
 from ta.momentum import RSIIndicator, StochasticOscillator, WilliamsRIndicator
@@ -15,6 +17,39 @@ from ta.volatility import BollingerBands, AverageTrueRange
 from ta.volume import OnBalanceVolumeIndicator, VolumeWeightedAveragePrice
 
 logger = logging.getLogger(__name__)
+
+# Global Fear & Greed cache (daily value, no need to fetch every candle)
+_fng_cache = {"value": None, "yesterday": None, "fetched_at": 0}
+
+# Historical F&G data cache (for training — keyed by date string)
+_fng_history = {}
+
+
+def fetch_fng_history(days=100):
+    """
+    Fetch historical Fear & Greed Index data.
+    Returns dict mapping date string 'YYYY-MM-DD' to int value.
+    """
+    global _fng_history
+    if _fng_history:
+        return _fng_history
+
+    try:
+        resp = requests.get(
+            f"https://api.alternative.me/fng/?limit={days}&format=json",
+            timeout=15,
+        )
+        data = resp.json().get("data", [])
+        from datetime import datetime
+        for entry in data:
+            ts = int(entry["timestamp"])
+            date_str = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+            _fng_history[date_str] = int(entry["value"])
+        logger.info(f"Loaded {len(_fng_history)} days of historical F&G data")
+    except Exception as e:
+        logger.warning(f"Failed to fetch F&G history: {e}")
+
+    return _fng_history
 
 
 class FeatureEngine:
@@ -63,9 +98,18 @@ class FeatureEngine:
         df = self._add_volume_features(df)
         df = self._add_price_features(df)
         df = self._add_pattern_features(df)
+        df = self._add_sentiment_features(df)
+        df = self._add_time_features(df)
 
-        # Drop rows with NaN (from indicator warm-up period)
+        # Handle NaN from indicator warm-up period
+        # Indicators need varying warm-up periods (SMA200=200, SMA50=50, RSI=14, etc).
+        # Back-fill early NaN rows so we retain enough rows for LSTM sequence input.
+        # This is safe because early indicators are approximately constant during warm-up.
         initial_rows = len(df)
+        price_cols_set = {"timestamp", "open", "high", "low", "close", "volume"}
+        feature_cols = [c for c in df.columns if c not in price_cols_set]
+        if feature_cols:
+            df[feature_cols] = df[feature_cols].bfill().ffill()
         df = df.dropna()
         dropped = initial_rows - len(df)
         if dropped > 0:
@@ -283,6 +327,142 @@ class FeatureEngine:
 
         return df
 
+    def _add_sentiment_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add Fear & Greed Index features.
+
+        For training (historical data with timestamps): uses historical F&G API,
+        aligns by date, and computes per-row values.
+
+        For live inference: uses cached live API value (single scalar).
+        """
+        global _fng_cache
+
+        # Try historical alignment first (training mode)
+        has_historical = False
+        if "timestamp" in df.columns and len(df) > 50:
+            try:
+                fng_hist = fetch_fng_history(days=120)
+                if fng_hist:
+                    ts = pd.to_datetime(df["timestamp"])
+                    date_strs = ts.dt.strftime("%Y-%m-%d")
+                    fng_values = date_strs.map(fng_hist).astype(float)
+
+                    # Forward-fill missing days (weekends etc shouldn't matter for crypto
+                    # but API might have gaps)
+                    fng_values = fng_values.ffill().bfill()
+
+                    if fng_values.notna().sum() > len(df) * 0.5:
+                        has_historical = True
+                        fng_vals = fng_values.values
+
+                        df["fng_score"] = fng_vals / 50.0 - 1.0
+                        df["fng_delta"] = pd.Series(fng_vals).diff().fillna(0).values / 100.0
+                        df["extreme_fear"] = (fng_vals < 20).astype(int)
+                        df["extreme_greed"] = (fng_vals > 80).astype(int)
+
+                        # Vectorized contrarian signal
+                        contrarian = np.zeros(len(df))
+                        contrarian[fng_vals < 20] = 1.0
+                        contrarian[(fng_vals >= 20) & (fng_vals < 35)] = 0.5
+                        contrarian[(fng_vals > 65) & (fng_vals <= 80)] = -0.5
+                        contrarian[fng_vals > 80] = -1.0
+                        df["sentiment_contrarian"] = contrarian
+
+                        logger.debug(f"Historical F&G: {fng_values.notna().sum()}/{len(df)} rows matched")
+            except Exception as e:
+                logger.debug(f"Historical F&G alignment failed: {e}")
+
+        # Fallback: live API (inference mode)
+        if not has_historical:
+            try:
+                now = time.time()
+                if _fng_cache["value"] is None or (now - _fng_cache["fetched_at"]) > 14400:
+                    resp = requests.get(
+                        "https://api.alternative.me/fng/?limit=2",
+                        timeout=10,
+                    )
+                    data = resp.json().get("data", [])
+                    if len(data) >= 2:
+                        _fng_cache["value"] = int(data[0]["value"])
+                        _fng_cache["yesterday"] = int(data[1]["value"])
+                        _fng_cache["fetched_at"] = now
+                    elif len(data) >= 1:
+                        _fng_cache["value"] = int(data[0]["value"])
+                        _fng_cache["yesterday"] = _fng_cache["value"]
+                        _fng_cache["fetched_at"] = now
+
+                fng = _fng_cache["value"]
+                fng_yesterday = _fng_cache["yesterday"]
+
+                if fng is not None:
+                    df["fng_score"] = fng / 50.0 - 1.0
+                    df["fng_delta"] = (fng - fng_yesterday) / 100.0 if fng_yesterday else 0.0
+                    df["extreme_fear"] = 1 if fng < 20 else 0
+                    df["extreme_greed"] = 1 if fng > 80 else 0
+
+                    if fng < 20:
+                        df["sentiment_contrarian"] = 1.0
+                    elif fng < 35:
+                        df["sentiment_contrarian"] = 0.5
+                    elif fng > 80:
+                        df["sentiment_contrarian"] = -1.0
+                    elif fng > 65:
+                        df["sentiment_contrarian"] = -0.5
+                    else:
+                        df["sentiment_contrarian"] = 0.0
+                else:
+                    df["fng_score"] = 0.0
+                    df["fng_delta"] = 0.0
+                    df["extreme_fear"] = 0
+                    df["extreme_greed"] = 0
+                    df["sentiment_contrarian"] = 0.0
+
+            except Exception as e:
+                logger.debug(f"Fear & Greed fetch failed: {e}")
+                df["fng_score"] = 0.0
+                df["fng_delta"] = 0.0
+                df["extreme_fear"] = 0
+                df["extreme_greed"] = 0
+                df["sentiment_contrarian"] = 0.0
+
+        return df
+
+    def _add_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add time-based features (hour of day, day of week)."""
+        if "timestamp" in df.columns:
+            try:
+                ts = pd.to_datetime(df["timestamp"])
+
+                # Hour of day (0-23) — normalized to [-1, 1] via sin/cos for cyclical nature
+                hour = ts.dt.hour
+                df["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+                df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+
+                # Day of week (0=Mon, 6=Sun) — sin/cos encoding
+                dow = ts.dt.dayofweek
+                df["dow_sin"] = np.sin(2 * np.pi * dow / 7)
+                df["dow_cos"] = np.cos(2 * np.pi * dow / 7)
+
+                # Weekend flag (low liquidity)
+                df["is_weekend"] = (dow >= 5).astype(int)
+
+            except Exception as e:
+                logger.debug(f"Time features failed: {e}")
+                df["hour_sin"] = 0.0
+                df["hour_cos"] = 1.0
+                df["dow_sin"] = 0.0
+                df["dow_cos"] = 1.0
+                df["is_weekend"] = 0
+        else:
+            df["hour_sin"] = 0.0
+            df["hour_cos"] = 1.0
+            df["dow_sin"] = 0.0
+            df["dow_cos"] = 1.0
+            df["is_weekend"] = 0
+
+        return df
+
     def calculate_multi_tf_features(
         self,
         candles_1h: pd.DataFrame,
@@ -334,7 +514,11 @@ class FeatureEngine:
             except Exception as e:
                 logger.warning(f"1D features failed: {e}")
 
-        # Drop NaN rows from merge and update feature names
+        # Forward-fill NaN from higher-TF merge (they update less frequently)
+        # then drop only leading NaN rows that can't be filled
+        tf_cols = [c for c in df.columns if c.startswith('tf4h_') or c.startswith('tf1d_')]
+        if tf_cols:
+            df[tf_cols] = df[tf_cols].ffill()
         df = df.dropna()
         price_cols = ["timestamp", "open", "high", "low", "close", "volume"]
         self.feature_names = [c for c in df.columns if c not in price_cols]
@@ -447,8 +631,9 @@ def create_target_labels(df: pd.DataFrame, lookahead: int = 6, threshold: float 
     - -1 (SELL): Price goes down more than threshold
     - 0 (HOLD): Price stays within threshold
 
-    Uses adaptive threshold based on recent volatility to ensure
-    balanced label distribution across different market conditions.
+    Uses percentile-based thresholds computed SEPARATELY for positive and
+    negative returns to guarantee symmetric BUY/SELL label counts regardless
+    of market drift (bullish or bearish).
 
     Args:
         df: DataFrame with 'close' column
@@ -460,16 +645,26 @@ def create_target_labels(df: pd.DataFrame, lookahead: int = 6, threshold: float 
     """
     future_return = df["close"].pct_change(periods=lookahead).shift(-lookahead)
 
-    # Use adaptive threshold: median absolute return scaled down
-    # This ensures roughly balanced BUY/SELL labels regardless of market regime
-    abs_returns = future_return.abs()
-    adaptive_threshold = abs_returns.rolling(window=168, min_periods=24).median() * 0.5
-    adaptive_threshold = adaptive_threshold.clip(lower=threshold, upper=0.02)
+    # Percentile-based symmetric thresholds:
+    # Use rolling window to find the 65th percentile of positive returns
+    # and the 35th percentile of negative returns (mirror image).
+    # This guarantees ~35% BUY, ~30% HOLD, ~35% SELL regardless of drift.
+    pos_returns = future_return.clip(lower=0)
+    neg_returns = future_return.clip(upper=0)
+
+    buy_threshold = pos_returns.rolling(window=168, min_periods=24).quantile(0.55)
+    sell_threshold = neg_returns.rolling(window=168, min_periods=24).quantile(0.45)
+
+    # Enforce minimum thresholds to avoid noise
+    buy_threshold = buy_threshold.clip(lower=threshold)
+    sell_threshold = sell_threshold.clip(upper=-threshold)
+
     # Fill NaN with static threshold
-    adaptive_threshold = adaptive_threshold.fillna(threshold)
+    buy_threshold = buy_threshold.fillna(threshold)
+    sell_threshold = sell_threshold.fillna(-threshold)
 
     labels = pd.Series(0, index=df.index)
-    labels[future_return > adaptive_threshold] = 1   # BUY signal
-    labels[future_return < -adaptive_threshold] = -1  # SELL signal
+    labels[future_return > buy_threshold] = 1    # BUY signal
+    labels[future_return < sell_threshold] = -1   # SELL signal
 
     return labels

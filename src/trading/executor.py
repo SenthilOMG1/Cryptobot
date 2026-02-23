@@ -409,37 +409,25 @@ class TradeExecutor:
         )
 
     @staticmethod
-    def calculate_dynamic_leverage(confidence: float, max_leverage: int = 7) -> int:
+    def calculate_dynamic_leverage(confidence: float, max_leverage: int = 10) -> int:
         """
-        Calculate leverage based on model confidence.
-
-        Higher confidence = higher leverage for bigger instant profits.
-        Lower confidence = lower leverage for safety.
-
-        Tiers:
-            50-55% → 2x (cautious entry)
-            55-65% → 3x (moderate)
-            65-75% → 5x (confident)
-            75%+   → max_leverage (very confident, quick profit scenario)
-
-        Args:
-            confidence: Model confidence (0.0 to 1.0)
-            max_leverage: Maximum allowed leverage (from config)
-
-        Returns:
-            Leverage multiplier (int)
+        Scale leverage by confidence. Higher confidence = higher leverage.
+        Low conf (<0.5): 3x minimum for safety
+        Med conf (0.5-0.7): scale linearly from 3x to max
+        High conf (>0.7): full max leverage
         """
-        if confidence >= 0.75:
-            return max_leverage  # Full send - bot is very confident
-        elif confidence >= 0.65:
-            return min(5, max_leverage)
-        elif confidence >= 0.55:
+        if confidence < 0.5:
             return min(3, max_leverage)
+        elif confidence < 0.7:
+            # Linear scale: 0.5->3x, 0.7->max
+            ratio = (confidence - 0.5) / 0.2
+            lev = int(3 + ratio * (max_leverage - 3))
+            return min(lev, max_leverage)
         else:
-            return 2  # Minimum leverage for low confidence
+            return max_leverage
 
     @staticmethod
-    def calculate_adaptive_leverage(position, max_leverage: int = 7) -> int:
+    def calculate_adaptive_leverage(position, max_leverage: int = 10) -> int:
         """
         Adjust leverage on open position based on how the trade is going.
 
@@ -750,7 +738,7 @@ class TradeExecutor:
                 error=str(e)
             )
 
-    def close_futures_position(self, pair: str, entry_price: float = 0, margin_mode: str = "cross") -> TradeResult:
+    def close_futures_position(self, pair: str, entry_price: float = 0, margin_mode: str = "cross", amount: float = 0) -> TradeResult:
         """
         Close a futures/short position.
 
@@ -771,10 +759,10 @@ class TradeExecutor:
                 pnl = 0
                 pnl_pct = 0
                 if entry_price > 0:
-                    # We don't know direction here, but the position tracker does
-                    # Use entry > current as short indicator
-                    pnl = (entry_price - current_price)  # Approximate per-unit
-                    pnl_pct = (pnl / entry_price) * 100
+                    # PnL for shorts: (entry - exit) * amount
+                    pnl_per_unit = (entry_price - current_price)
+                    pnl = pnl_per_unit * amount if amount > 0 else pnl_per_unit
+                    pnl_pct = (pnl_per_unit / entry_price) * 100
 
                 trade_result = TradeResult(
                     success=True,

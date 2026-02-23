@@ -197,9 +197,21 @@ class SecureOKXClient:
         return balances
 
     def get_usdt_balance(self) -> float:
-        """Get available USDT balance."""
+        """Get available USDT balance (for position sizing)."""
         balances = self.get_balance("USDT")
         return balances.get("USDT", 0.0)
+
+    def get_total_equity(self) -> float:
+        """Get total account equity including margin (for portfolio tracking)."""
+        self._rate_limit()
+        response = self._account_api.get_account_balance(ccy="USDT")
+        data = self._handle_response(response, "get_total_equity")
+        if data and len(data) > 0:
+            details = data[0].get("details", [])
+            for item in details:
+                if item.get("ccy") == "USDT":
+                    return float(item.get("eq", 0))
+        return 0.0
 
     def get_positions(self) -> List[Dict[str, Any]]:
         """
@@ -458,6 +470,72 @@ class SecureOKXClient:
 
         response = self._account_api.get_positions(**params)
         return self._handle_response(response, "get_futures_positions")
+
+    # ==================== Algo Orders (Hard Stop-Losses) ====================
+
+    def place_stop_loss_order(
+        self,
+        pair: str,
+        side: str,
+        trigger_price: str,
+        margin_mode: str = "cross"
+    ) -> Dict[str, Any]:
+        """
+        Place a hard stop-loss algo order on OKX exchange.
+        Uses closeFraction=1 to close 100% of the position.
+        This protects positions even if the bot is offline.
+
+        Args:
+            pair: Spot pair name (e.g. 'SOL-USDT'), converted to SWAP
+            side: 'buy' to close a short, 'sell' to close a long
+            trigger_price: Price at which stop-loss triggers
+            margin_mode: 'cross' or 'isolated'
+
+        Returns:
+            Dict with algoId on success
+        """
+        self._rate_limit()
+        swap_id = self.spot_to_swap(pair)
+
+        logger.info(f"Placing HARD stop-loss: {swap_id} {side} @ trigger ${trigger_price}")
+        response = self._trade_api.place_algo_order(
+            instId=swap_id,
+            tdMode=margin_mode,
+            side=side,
+            ordType="conditional",
+            sz="",
+            closeFraction="1",  # Close 100% of position
+            slTriggerPx=str(trigger_price),
+            slOrdPx="-1",  # -1 = market order when triggered
+            slTriggerPxType="mark",  # Use mark price to avoid manipulation
+            reduceOnly="true",
+        )
+        result = self._handle_response(response, "place_stop_loss_order")
+
+        if result:
+            algo_id = result[0].get("algoId", "")
+            logger.info(f"Hard stop-loss placed: {algo_id} for {swap_id}")
+
+        return result[0] if result else {}
+
+    def cancel_algo_order(self, pair: str, algo_id: str) -> Dict[str, Any]:
+        """Cancel an algo order."""
+        self._rate_limit()
+        swap_id = self.spot_to_swap(pair)
+        response = self._trade_api.cancel_algo_order([{
+            "instId": swap_id,
+            "algoId": algo_id
+        }])
+        return self._handle_response(response, "cancel_algo_order")
+
+    def get_pending_algo_orders(self, pair: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get pending algo orders (stop-losses, take-profits, etc.)."""
+        self._rate_limit()
+        params = {"ordType": "conditional"}
+        if pair:
+            params["instId"] = self.spot_to_swap(pair)
+        response = self._trade_api.order_algos_list(**params)
+        return self._handle_response(response, "get_pending_algo_orders")
 
     # ==================== Public Data ====================
 

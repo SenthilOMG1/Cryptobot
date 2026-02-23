@@ -107,15 +107,17 @@ class RiskManager:
         self,
         balance: float,
         confidence: float,
-        current_positions: int
+        current_positions: int,
+        volatility_scale: float = 1.0
     ) -> float:
         """
-        Calculate safe position size based on confidence and portfolio state.
+        Calculate safe position size based on confidence, portfolio state, and volatility.
 
         Args:
             balance: Available USDT balance
             confidence: Model confidence (0.0 to 1.0)
             current_positions: Number of existing positions
+            volatility_scale: Multiplier from regime detector (1.0=normal, 0.4=high vol)
 
         Returns:
             Maximum trade amount in USDT
@@ -132,33 +134,48 @@ class RiskManager:
         position_scale = 1.0 - (current_positions * 0.15)  # -15% per existing position
         position_scale = max(0.5, position_scale)
 
+        # Apply volatility scaling (high vol = smaller positions, not blocked trades)
+        vol_scale = max(0.0, min(1.0, volatility_scale))
+
         # Final percentage
-        final_pct = max_pct * confidence_scale * position_scale
+        final_pct = max_pct * confidence_scale * position_scale * vol_scale
 
         # Calculate actual amount
         trade_amount = balance * (final_pct / 100)
 
         logger.debug(
             f"Position size: ${trade_amount:.2f} "
-            f"({final_pct:.1f}% of ${balance:.2f})"
+            f"({final_pct:.1f}% of ${balance:.2f}, vol_scale={vol_scale:.2f})"
         )
 
         return trade_amount
 
-    def check_stop_loss(self, position) -> bool:
+    def check_stop_loss(self, position, atr_pct: float = 0.0) -> bool:
         """
         Check if position should be stopped out.
+        Uses adaptive stop: max(configured_stop, 1.5 * ATR%) to avoid
+        getting stopped by normal volatility.
 
         Args:
             position: Position object
+            atr_pct: Current ATR as percentage of price (0-100 scale)
 
         Returns:
             True if stop-loss triggered
         """
-        if position.unrealized_pnl_pct <= -self.limits.stop_loss_pct:
+        # Adaptive stop loss: max(configured, 1.5 * ATR%)
+        adaptive_stop = self.limits.stop_loss_pct
+        if atr_pct > 0:
+            atr_stop = 1.5 * atr_pct
+            adaptive_stop = max(self.limits.stop_loss_pct, atr_stop)
+            # Cap at 10% to prevent runaway stops
+            adaptive_stop = min(adaptive_stop, 10.0)
+
+        if position.unrealized_pnl_pct <= -adaptive_stop:
             logger.warning(
                 f"STOP-LOSS triggered for {position.pair}: "
-                f"{position.unrealized_pnl_pct:.2f}% < -{self.limits.stop_loss_pct}%"
+                f"{position.unrealized_pnl_pct:.2f}% < -{adaptive_stop:.1f}% "
+                f"(base: {self.limits.stop_loss_pct}%, ATR: {atr_pct:.2f}%)"
             )
             return True
         return False

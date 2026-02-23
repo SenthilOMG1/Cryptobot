@@ -29,6 +29,7 @@ class Position:
     leverage: int = 1  # Current leverage for futures positions
     max_leverage: int = 1  # Max leverage allowed (from confidence at entry)
     entry_confidence: float = 0.0  # Confidence when position was opened
+    stop_loss_algo_id: str = ""  # OKX algo order ID for hard stop-loss
 
     def update_price(self, price: float):
         """Update position with current price. Direction-aware P&L."""
@@ -118,12 +119,16 @@ class PositionTracker:
     def sync_futures_from_exchange(self, futures_pairs: list):
         """
         Sync open futures positions from OKX on startup.
+        Also removes stale positions that no longer exist on exchange.
 
         Args:
             futures_pairs: List of spot pair names enabled for futures
         """
         try:
             positions_data = self.okx.get_futures_positions()
+
+            # Build set of actually open positions on exchange
+            exchange_keys = set()
             for pos in positions_data:
                 inst_id = pos.get("instId", "")  # e.g. "SOL-USDT-SWAP"
                 pos_amt = float(pos.get("pos", 0))
@@ -140,6 +145,7 @@ class PositionTracker:
                 amount = abs(pos_amt)
 
                 key = f"{pair}:futures"
+                exchange_keys.add(key)
                 if key not in self.positions:
                     mark_price = float(pos.get("markPx", avg_price))
                     self.positions[key] = Position(
@@ -154,6 +160,12 @@ class PositionTracker:
                         mode="futures"
                     )
                     logger.info(f"Recovered futures position: {pair} {side} x{amount} @ ${avg_price}")
+
+            # Remove stale futures positions not on exchange
+            stale_keys = [k for k in self.positions if k.endswith(":futures") and k not in exchange_keys]
+            for key in stale_keys:
+                removed = self.positions.pop(key)
+                logger.info(f"Removed stale futures position: {removed.pair} (no longer on exchange)")
 
         except Exception as e:
             logger.error(f"Failed to sync futures positions: {e}")
@@ -285,14 +297,18 @@ class PositionTracker:
         """Get portfolio summary."""
         self.update_prices()
 
+        # Use total equity (includes margin) for accurate portfolio tracking
+        total_equity = self.okx.get_total_equity() if hasattr(self.okx, 'get_total_equity') else 0
         usdt_balance = self.okx.get_usdt_balance()
-        positions_value = self.get_total_value()
-        total_value = usdt_balance + positions_value
+        # Only count SPOT positions value — futures margin is already in equity
+        spot_value = sum(p.amount * p.current_price for p in self.positions.values() if p.mode == "spot")
+        # total_value = equity (includes margin + UPL) for circuit breaker accuracy
+        total_value = total_equity if total_equity > 0 else (usdt_balance + spot_value)
         unrealized_pnl = self.get_total_unrealized_pnl()
 
         return {
             "usdt_balance": usdt_balance,
-            "positions_value": positions_value,
+            "positions_value": spot_value,
             "total_value": total_value,
             "unrealized_pnl": unrealized_pnl,
             "num_positions": len(self.positions),

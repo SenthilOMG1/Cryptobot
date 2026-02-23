@@ -42,6 +42,21 @@ SESSIONS_DIR = "/home/miya/.claude/projects/-root"
 # Session state - which session to continue
 current_session_id = None  # None = use --continue (most recent)
 
+# Per-chat concurrency: lock + message queue so users can send while Miya is busy
+_chat_locks = {}   # chat_id -> asyncio.Lock
+_chat_queues = {}  # chat_id -> list of (user_name, mem0_uid, message_text)
+_active_proc = {}  # chat_id -> subprocess.Popen (for /steer to kill)
+
+# Background phone tasks - run independently so they don't block chat
+_phone_task_running = False
+
+
+def _get_chat_lock(chat_id: int):
+    """Get or create an asyncio.Lock for a chat."""
+    if chat_id not in _chat_locks:
+        _chat_locks[chat_id] = asyncio.Lock()
+    return _chat_locks[chat_id]
+
 # Mem0 - shared memory with Miya Android app
 MEM0_API_KEY = os.environ.get("MEM0_API_KEY", "")
 mem0_client = None
@@ -158,7 +173,19 @@ requests.post('https://api.telegram.org/bot8382776877:AAH8R-Tt0rUU_tHGFN3dTPnate
 "
 - Use detailed prompts for better results (style, colors, mood, subject)
 - You can also generate with Pillow/matplotlib for charts, graphs, designs
-- Always send the result to Telegram after generating"""
+- Always send the result to Telegram after generating
+
+PHONE REMOTE CONTROL (via MIYA Android App):
+- Senthil's phone runs the MIYA app which connects to the VPS via WebSocket
+- You can control the phone remotely through the Push API at http://127.0.0.1:8766
+- Check if phone is connected: curl http://127.0.0.1:8766/status
+- Execute a tool on the phone: curl -X POST http://127.0.0.1:8766/tool -H 'Content-Type: application/json' -d '{"tool": "tool_name", "params": {"key": "value"}}'
+- Send a display message to phone: curl -X POST http://127.0.0.1:8766/push -H 'Content-Type: application/json' -d '{"message": "text to show"}'
+- Available phone tools include: open_app, set_timer, set_alarm, phone_tap, phone_swipe, phone_type, take_screenshot, get_clipboard, set_clipboard, send_sms, make_call, get_location, toggle_flashlight, set_volume, get_battery, get_wifi_info, share_location
+- Example: To open WhatsApp: curl -X POST http://127.0.0.1:8766/tool -H 'Content-Type: application/json' -d '{"tool": "open_app", "params": {"package": "com.whatsapp"}}'
+- Example: To share location: First get location with get_location tool, then open WhatsApp and share it
+- IMPORTANT: If the phone is not connected, tell the user and don't try to push commands
+- Bhavya can ask you to do phone things too (like "open WhatsApp and share location") - check phone status first, then execute"""
 
 
 def auth(func):
@@ -190,9 +217,55 @@ def owner_only(func):
     return wrapper
 
 
+def _format_tool_progress(tool_name: str, tool_input: dict) -> str:
+    """Format a tool call into a nice Telegram progress message."""
+    icons = {
+        "Read": "📖", "Write": "✏️", "Edit": "✏️",
+        "Bash": "🔧", "Glob": "🔍", "Grep": "🔍",
+        "WebFetch": "🌐", "WebSearch": "🌐",
+        "Task": "🚀", "TaskCreate": "📋", "TaskUpdate": "✅",
+    }
+    icon = icons.get(tool_name, "⚙️")
+
+    if tool_name == "Read":
+        path = tool_input.get("file_path", "?")
+        short = path.rsplit("/", 1)[-1]
+        return f"{icon} Reading {short}"
+    elif tool_name in ("Write", "Edit"):
+        path = tool_input.get("file_path", "?")
+        short = path.rsplit("/", 1)[-1]
+        return f"{icon} Editing {short}"
+    elif tool_name == "Bash":
+        desc = tool_input.get("description", "")
+        if desc:
+            return f"{icon} {desc}"
+        cmd = tool_input.get("command", "")[:80]
+        return f"{icon} Running: {cmd}"
+    elif tool_name in ("Glob", "Grep"):
+        pattern = tool_input.get("pattern", "")[:60]
+        return f"{icon} Searching: {pattern}"
+    elif tool_name == "WebSearch":
+        query = tool_input.get("query", "")[:60]
+        return f"{icon} Searching: {query}"
+    elif tool_name == "WebFetch":
+        url = tool_input.get("url", "")[:60]
+        return f"{icon} Fetching: {url}"
+    elif tool_name == "TaskCreate":
+        subject = tool_input.get("subject", "")
+        return f"{icon} Task: {subject}"
+    elif tool_name == "TaskUpdate":
+        status = tool_input.get("status", "")
+        if status == "completed":
+            return f"✅ Task completed"
+        return None  # skip non-completion updates
+    else:
+        return f"{icon} {tool_name}"
+
+
 def _build_claude_cmd(message: str, session_id: str = None, use_continue: bool = False) -> list:
     """Build the claude command as miya user with --dangerously-skip-permissions."""
-    parts = ["claude", "--dangerously-skip-permissions", "--print",
+    parts = ["claude", "--dangerously-skip-permissions",
+             "--verbose", "--output-format", "stream-json",
              "--append-system-prompt", SYSTEM_PROMPT]
 
     if session_id and not use_continue:
@@ -224,8 +297,23 @@ def _send_telegram_sync(chat_id: int, text: str):
         pass
 
 
+def _extract_stream_result(raw_output: str) -> str:
+    """Extract the final result text from stream-json output."""
+    for line in raw_output.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+            if data.get("type") == "result":
+                return data.get("result", "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return ""
+
+
 def run_claude(message: str, session_id: str = None, chat_id: int = None) -> str:
-    """Run Claude Code as miya user with full permissions and live progress updates."""
+    """Run Claude Code as miya user with live tool progress via stream-json."""
     global current_session_id
     import time as _time
     import threading
@@ -242,56 +330,92 @@ def run_claude(message: str, session_id: str = None, chat_id: int = None) -> str
             env={**os.environ, "TERM": "dumb", "NO_COLOR": "1"}
         )
 
+        # Track active process so /steer can interrupt
+        if chat_id:
+            _active_proc[chat_id] = proc
+
         output_lines = []
+        result_text = ""
         start_time = _time.time()
-        last_update_time = start_time
-        update_interval = 45  # Send progress update every 45 seconds
-        timeout = 300  # 5 minute overall timeout
+        last_progress_time = 0
+        progress_min_interval = 5  # Min seconds between progress messages
+        timeout = 300
         timed_out = False
 
-        # Read output in a background thread to avoid blocking
+        def _process_line(line: str):
+            """Parse a stream-json line and send tool progress to Telegram."""
+            nonlocal result_text, last_progress_time
+
+            line = line.strip()
+            if not line:
+                return
+            try:
+                data = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                return
+
+            msg_type = data.get("type", "")
+
+            # Capture final result
+            if msg_type == "result":
+                result_text = data.get("result", "")
+                return
+
+            # Look for tool calls in assistant messages
+            if msg_type == "assistant":
+                content = data.get("message", {}).get("content", [])
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "tool_use":
+                        continue
+
+                    tool_name = block.get("name", "")
+                    tool_input = block.get("input", {})
+
+                    # Rate limit progress updates
+                    now = _time.time()
+                    if chat_id and (now - last_progress_time) >= progress_min_interval:
+                        progress_msg = _format_tool_progress(tool_name, tool_input)
+                        if progress_msg:
+                            last_progress_time = now
+                            _send_telegram_sync(chat_id, progress_msg)
+
+        # Read and process output in background thread
         def _reader():
             for line in proc.stdout:
                 output_lines.append(line)
+                try:
+                    _process_line(line)
+                except Exception:
+                    pass
 
         reader_thread = threading.Thread(target=_reader, daemon=True)
         reader_thread.start()
 
         while proc.poll() is None:
             elapsed = _time.time() - start_time
-
-            # Send progress update every N seconds
-            if chat_id and (elapsed - (last_update_time - start_time)) >= update_interval:
-                last_update_time = _time.time()
-                mins = int(elapsed // 60)
-                secs = int(elapsed % 60)
-                # Grab last meaningful output line as status hint
-                hint = ""
-                for line in reversed(output_lines):
-                    stripped = line.strip()
-                    if stripped and not stripped.startswith(("HTTP", "Warning", "  ")):
-                        hint = stripped[:100]
-                        break
-                progress_msg = f"⏳ Still working... ({mins}m {secs}s)"
-                if hint:
-                    progress_msg += f"\n> {hint}"
-                _send_telegram_sync(chat_id, progress_msg)
-
-            # Timeout check
             if elapsed > timeout:
                 proc.kill()
                 timed_out = True
                 break
-
             _time.sleep(1)
 
         reader_thread.join(timeout=5)
 
-        output = "".join(output_lines).strip()
+        # Clear active process tracking
+        if chat_id:
+            _active_proc.pop(chat_id, None)
+
+        raw_output = "".join(output_lines)
         stderr = proc.stderr.read().strip() if proc.stderr else ""
 
+        # If result wasn't captured from stream, try parsing all output
+        if not result_text:
+            result_text = _extract_stream_result(raw_output)
+
         # If session not found, fall back to --continue
-        if "No conversation found" in (output + stderr) and sid:
+        if "No conversation found" in (raw_output + stderr) and sid:
             logger.warning(f"Session {sid[:12]} not found, falling back to --continue")
             current_session_id = None
             cmd2 = _build_claude_cmd(message, use_continue=True)
@@ -302,23 +426,138 @@ def run_claude(message: str, session_id: str = None, chat_id: int = None) -> str
                 timeout=300,
                 env={**os.environ, "TERM": "dumb", "NO_COLOR": "1"}
             )
-            output = result.stdout.strip()
+            result_text = _extract_stream_result(result.stdout)
             stderr = result.stderr.strip()
 
         if timed_out:
-            if output:
-                return f"⏰ Timed out after 5 min but here's what I got:\n\n{output}"
+            if result_text:
+                return f"⏰ Timed out after 5 min but here's what I got:\n\n{result_text}"
             return "⏰ Timed out (5 min limit). Try a simpler request or break it into steps."
 
-        if not output and stderr:
-            output = f"Error: {stderr}"
-        if not output:
-            output = "No response from Claude."
+        if not result_text and stderr:
+            result_text = f"Error: {stderr}"
+        if not result_text:
+            result_text = "No response from Claude."
 
-        return output
+        return result_text
 
     except Exception as e:
         return f"Error: {str(e)}"
+
+
+def phone_tool(tool_name: str, params: dict) -> str:
+    """Execute a phone tool via Push API. Fast, doesn't need Claude subprocess."""
+    import requests as _req
+    try:
+        r = _req.post("http://127.0.0.1:8766/tool",
+                       json={"tool": tool_name, "params": params}, timeout=30)
+        data = r.json()
+        return data.get("result", "No result")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def phone_status() -> dict:
+    """Check phone connection status."""
+    import requests as _req
+    try:
+        return _req.get("http://127.0.0.1:8766/status", timeout=3).json()
+    except Exception:
+        return {"connected": False}
+
+
+PHONE_AGENT_PROMPT = """You are Miya's phone control subagent. You control Senthil's phone via the Push API.
+You run in background while Miya chats normally on Telegram.
+
+RULES:
+- Execute phone commands via Bash using python3 with requests to http://127.0.0.1:8766/tool
+- Available tools: phone_open_app (param: app), phone_tap (params: x, y), phone_type (param: text),
+  phone_read_screen, phone_scroll (param: direction), phone_go_back, phone_go_home,
+  phone_swipe (params: direction), get_battery, get_location, set_timer (param: minutes),
+  set_alarm (params: hour, minute), phone_long_press (params: x, y), phone_wait (param: seconds)
+- To execute a tool: python3 -c "import requests; r=requests.post('http://127.0.0.1:8766/tool', json={'tool':'TOOL','params':{}}, timeout=30); print(r.text)"
+- Read the screen before tapping to find element coordinates
+- Wait 1-2 seconds between actions for the phone to respond
+- When typing in WhatsApp/apps: tap the input field FIRST, wait, then type
+- Keep it concise - report what you did, not every detail
+- If something fails, try a different approach"""
+
+
+def run_phone_agent(task: str, chat_id: int) -> str:
+    """Run a separate Claude subprocess for phone control. Does NOT hold the chat lock."""
+    try:
+        parts = [
+            "claude", "-p", "--dangerously-skip-permissions",
+            "--output-format", "stream-json", "--verbose",
+            "--append-system-prompt", PHONE_AGENT_PROMPT,
+            task
+        ]
+        escaped = []
+        for p in parts:
+            escaped.append("'" + p.replace("'", "'\"'\"'") + "'")
+        shell_cmd = f"cd {WORKING_DIR} && {' '.join(escaped)}"
+        cmd = ["su", "-", "miya", "-c", shell_cmd]
+
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env={**os.environ, "TERM": "dumb", "NO_COLOR": "1"}
+        )
+
+        import time as _time, threading
+        output_lines = []
+        result_text = ""
+
+        def _process_line(line):
+            nonlocal result_text
+            line = line.strip()
+            if not line:
+                return
+            try:
+                data = json.loads(line)
+                if data.get("type") == "result":
+                    result_text = data.get("result", "")
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        def _reader():
+            for line in proc.stdout:
+                output_lines.append(line)
+                try:
+                    _process_line(line)
+                except Exception:
+                    pass
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
+
+        start = _time.time()
+        while proc.poll() is None:
+            if _time.time() - start > 180:  # 3 min timeout for phone tasks
+                proc.kill()
+                break
+            _time.sleep(1)
+        reader.join(timeout=5)
+
+        if not result_text:
+            result_text = _extract_stream_result("".join(output_lines))
+        return result_text or "Phone task completed."
+    except Exception as e:
+        return f"Phone agent error: {e}"
+
+
+# Keywords that suggest phone control requests
+_PHONE_KEYWORDS = [
+    "open ", "whatsapp", "text ", "message ", "send ", "call ",
+    "screenshot", "screen", "phone", "alarm", "timer",
+    "brightness", "volume", "flashlight", "location",
+    "tap ", "swipe", "type ", "battery",
+]
+
+
+def _is_phone_request(msg: str) -> bool:
+    """Check if a message is a phone control request."""
+    lower = msg.lower()
+    return any(kw in lower for kw in _PHONE_KEYWORDS)
 
 
 # Whisper model - loaded once at startup for fast transcription
@@ -482,6 +721,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/close [pair] - Close a position\n\n"
         "Bot Control:\n"
         "/status - System & bot status\n"
+        "/phone - Phone connection & remote control\n"
         "/services - All running services\n"
         "/config - Bot settings\n"
         "/logs - Recent logs\n"
@@ -489,7 +729,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/pause - Pause trading (monitor stays)\n"
         "/unpause - Resume trading\n"
         "/stop - Stop trading bot\n"
-        "/train - Start model training\n\n"
+        "/train - Start model training\n"
+        "/steer - Redirect Miya mid-task\n\n"
         "Sessions:\n"
         "/sessions - List Claude sessions\n"
         "/resume - Switch session\n"
@@ -502,7 +743,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @auth
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     services = {}
-    for svc in ["cryptobot", "telegram-bot", "cryptobot-mcp"]:
+    for svc in ["cryptobot", "telegram-bot", "cryptobot-mcp", "miya-brain"]:
         r = subprocess.run(["systemctl", "is-active", svc], capture_output=True, text=True)
         services[svc] = r.stdout.strip()
 
@@ -522,6 +763,19 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for svc, state in services.items():
         icon = "●" if state == "active" else "○"
         status_text += f"  {icon} {svc}: {state}\n"
+
+    # Check phone connection
+    try:
+        import requests as _req
+        phone = _req.get("http://127.0.0.1:8766/status", timeout=3).json()
+        if phone.get("connected"):
+            uptime_s = int(phone.get("uptime", 0))
+            mins = uptime_s // 60
+            status_text += f"\nPhone: Connected ({mins}m uptime)"
+        else:
+            status_text += "\nPhone: Not connected"
+    except Exception:
+        status_text += "\nPhone: Brain server offline"
 
     await update.message.reply_text(status_text)
 
@@ -666,7 +920,8 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Start fresh by running without --continue or --resume
     loop = asyncio.get_event_loop()
     fresh_msg = "New session started. You are Miya, Senthil's AI assistant connected via Telegram. Say hi to Senthil."
-    fresh_parts = ["claude", "--dangerously-skip-permissions", "--print",
+    fresh_parts = ["claude", "--dangerously-skip-permissions",
+                   "--verbose", "--output-format", "stream-json",
                    "--append-system-prompt", SYSTEM_PROMPT, fresh_msg]
     escaped = []
     for p in fresh_parts:
@@ -686,7 +941,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if session_files:
         current_session_id = os.path.basename(session_files[0]).replace(".jsonl", "")
 
-    output = response.stdout.strip() if response.stdout.strip() else "New session started."
+    output = _extract_stream_result(response.stdout) if response.stdout else "New session started."
     await update.message.reply_text(f"Fresh session started.\n\n{output}")
 
 
@@ -697,6 +952,59 @@ async def cmd_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Session: {current_session_id[:12]}...\n\nUse /sessions to see all, /new for fresh.")
     else:
         await update.message.reply_text("Using most recent session (--continue mode).\n\nUse /sessions to see all, /new for fresh.")
+
+
+@owner_only
+async def cmd_steer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Interrupt Miya mid-task and redirect her with new guidance."""
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /steer <your guidance>\n\nExample: /steer skip that, focus on signing the APK first")
+        return
+
+    guidance = " ".join(args)
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id
+    user_info = AUTHORIZED_USERS.get(uid, {})
+    user_name = user_info.get("name", "Unknown")
+    mem0_uid = user_name.lower()
+
+    # Kill the active Claude process if running
+    proc = _active_proc.get(chat_id)
+    if proc and proc.poll() is None:
+        proc.kill()
+        proc.wait(timeout=5)
+        _active_proc.pop(chat_id, None)
+        await update.message.reply_text(f"🔀 Interrupted. Redirecting with: {guidance[:100]}")
+    else:
+        await update.message.reply_text(f"🔀 No active task — sending guidance directly.")
+
+    # Clear any queued messages and combine with steer
+    queued = _chat_queues.pop(chat_id, [])
+    queued_text = ""
+    if queued:
+        queued_text = "\nAlso, queued messages: " + " | ".join(msg for _, _, msg in queued)
+
+    # Release the lock if held (the killed process's handler will release it,
+    # but we send the steer as a fresh call)
+    lock = _get_chat_lock(chat_id)
+
+    # Wait briefly for lock to release after kill
+    for _ in range(10):
+        if not lock.locked():
+            break
+        await asyncio.sleep(0.5)
+
+    async with lock:
+        loop = asyncio.get_event_loop()
+        memories = await loop.run_in_executor(None, mem0_recall, guidance, mem0_uid)
+        prefixed = (
+            f"[STEERING from {user_name} — interrupted your current task to redirect you]{memories}: "
+            f"{guidance}{queued_text}"
+        )
+        response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=chat_id))
+        loop.run_in_executor(None, mem0_store, guidance, response, mem0_uid)
+        await send_response(update, response)
 
 
 @owner_only
@@ -959,6 +1267,35 @@ async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @auth
+async def cmd_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check phone connection status and available tools."""
+    try:
+        import requests as _req
+        phone = _req.get("http://127.0.0.1:8766/status", timeout=3).json()
+        if phone.get("connected"):
+            uptime_s = int(phone.get("uptime", 0))
+            hrs = uptime_s // 3600
+            mins = (uptime_s % 3600) // 60
+            text = (
+                f"Phone Status\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"● Connected ({hrs}h {mins}m)\n"
+                f"Clients: {phone.get('clients', 1)}\n\n"
+                f"To control the phone, just tell me what to do!\n"
+                f"Examples:\n"
+                f"  • \"Open WhatsApp on my phone\"\n"
+                f"  • \"Share my location with Bhavya\"\n"
+                f"  • \"Set an alarm for 7am\"\n"
+                f"  • \"Take a screenshot of my phone\""
+            )
+        else:
+            text = "Phone: Not connected\n\nMake sure MIYA app is open on the phone."
+    except Exception:
+        text = "Phone brain server is offline.\nCheck: systemctl status miya-brain"
+    await update.message.reply_text(text)
+
+
+@auth
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Memory commands. /memory, /memory search <query>, /memory count, /memory forget <query>"""
     if not mem0_client:
@@ -1086,21 +1423,30 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(text)
             return
 
-        await update.message.reply_text(f"You said: {text}\n\nProcessing...")
-
         # Send to Claude with user context + memories
         uid = update.effective_user.id
         user_name = AUTHORIZED_USERS.get(uid, {}).get("name", "Unknown")
         mem0_uid = user_name.lower()
-        memories = await loop.run_in_executor(None, mem0_recall, text, mem0_uid)
-        prefixed = f"[Voice message from {user_name}]{memories}: {text}"
         _chat_id = update.effective_chat.id
-        response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
+        lock = _get_chat_lock(_chat_id)
 
-        # Store in Mem0
-        loop.run_in_executor(None, mem0_store, text, response, mem0_uid)
+        # Queue if Miya is busy
+        if lock.locked():
+            _chat_queues.setdefault(_chat_id, []).append((user_name, mem0_uid, f"[Voice: {text}]"))
+            await update.message.reply_text(f"🎤 Transcribed: \"{text[:100]}\"\n📬 Queued — she's busy.")
+            return
 
-        await send_response(update, response)
+        await update.message.reply_text(f"You said: {text}\n\nProcessing...")
+
+        async with lock:
+            memories = await loop.run_in_executor(None, mem0_recall, text, mem0_uid)
+            prefixed = f"[Voice message from {user_name}]{memories}: {text}"
+            response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
+
+            # Store in Mem0
+            loop.run_in_executor(None, mem0_store, text, response, mem0_uid)
+
+            await send_response(update, response)
 
     except Exception as e:
         await update.message.reply_text(f"Voice error: {e}")
@@ -1133,25 +1479,28 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption = update.message.caption or "No caption"
         logger.info(f"Photo from {user_name}: {caption[:100]} -> {tmp_path}")
 
-        # Recall memories
-        loop = asyncio.get_event_loop()
-        memories = await loop.run_in_executor(None, mem0_recall, caption, mem0_uid)
-
-        # Tell Claude to look at the image file
-        prefixed = (
-            f"[Message from {user_name}]{memories}: "
-            f"[Senthil sent a photo saved at {tmp_path}. "
-            f"Use the Read tool to view it. Caption: \"{caption}\"]"
-        )
-
         _chat_id = update.effective_chat.id
-        response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
+        lock = _get_chat_lock(_chat_id)
+        loop = asyncio.get_event_loop()
 
-        # Store in Mem0
-        loop.run_in_executor(None, mem0_store, f"[Sent photo: {caption}]", response, mem0_uid)
+        if lock.locked():
+            _chat_queues.setdefault(_chat_id, []).append((user_name, mem0_uid, f"[Photo saved at {tmp_path}, caption: \"{caption}\"]"))
+            await update.message.reply_text("📬 Photo saved & queued — she's busy.")
+            return
 
-        await send_response(update, response)
-        logger.info(f"Photo response sent to {user_name} ({len(response)} chars)")
+        async with lock:
+            memories = await loop.run_in_executor(None, mem0_recall, caption, mem0_uid)
+            prefixed = (
+                f"[Message from {user_name}]{memories}: "
+                f"[Senthil sent a photo saved at {tmp_path}. "
+                f"Use the Read tool to view it. Caption: \"{caption}\"]"
+            )
+
+            response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
+            loop.run_in_executor(None, mem0_store, f"[Sent photo: {caption}]", response, mem0_uid)
+
+            await send_response(update, response)
+            logger.info(f"Photo response sent to {user_name} ({len(response)} chars)")
 
         # Clean up after a delay (give Claude time to read it)
         async def cleanup():
@@ -1222,22 +1571,27 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         video_desc = ". ".join(parts) if parts else "Video had no extractable audio or frames"
 
-        # Recall memories
-        query = caption or transcript or "sent a video"
-        memories = await loop.run_in_executor(None, mem0_recall, query, mem0_uid)
-
-        prefixed = (
-            f"[Message from {user_name}]{memories}: "
-            f"[Senthil sent a video. {video_desc}]"
-        )
-
         _chat_id = update.effective_chat.id
-        response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
+        lock = _get_chat_lock(_chat_id)
 
-        # Store in Mem0
-        loop.run_in_executor(None, mem0_store, f"[Sent video: {caption or transcript[:60] or 'no caption'}]", response, mem0_uid)
+        if lock.locked():
+            _chat_queues.setdefault(_chat_id, []).append((user_name, mem0_uid, f"[Video: {video_desc}]"))
+            await update.message.reply_text("📬 Video processed & queued — she's busy.")
+            return
 
-        await send_response(update, response)
+        async with lock:
+            query = caption or transcript or "sent a video"
+            memories = await loop.run_in_executor(None, mem0_recall, query, mem0_uid)
+
+            prefixed = (
+                f"[Message from {user_name}]{memories}: "
+                f"[Senthil sent a video. {video_desc}]"
+            )
+
+            response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
+            loop.run_in_executor(None, mem0_store, f"[Sent video: {caption or transcript[:60] or 'no caption'}]", response, mem0_uid)
+
+            await send_response(update, response)
 
         # Clean up after delay
         async def cleanup():
@@ -1359,43 +1713,105 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Other documents - just pass filename and caption to Claude
     caption = update.message.caption or ""
-    loop = asyncio.get_event_loop()
-    memories = await loop.run_in_executor(None, mem0_recall, caption or filename, mem0_uid)
-    prefixed = f"[Message from {user_name}]{memories}: [Sent a file: '{filename}' (type: {mime}). Caption: \"{caption}\"]"
     _chat_id = update.effective_chat.id
-    response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
-    await send_response(update, response)
+    lock = _get_chat_lock(_chat_id)
+    loop = asyncio.get_event_loop()
+
+    if lock.locked():
+        _chat_queues.setdefault(_chat_id, []).append((user_name, mem0_uid, f"[File: '{filename}', caption: \"{caption}\"]"))
+        await update.message.reply_text("📬 File noted & queued — she's busy.")
+        return
+
+    async with lock:
+        memories = await loop.run_in_executor(None, mem0_recall, caption or filename, mem0_uid)
+        prefixed = f"[Message from {user_name}]{memories}: [Sent a file: '{filename}' (type: {mime}). Caption: \"{caption}\"]"
+        response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
+        await send_response(update, response)
 
 
 @auth
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Route text messages to Claude Code."""
+    """Route text messages to Claude Code. Queues messages if Miya is busy."""
     user_message = update.message.text
     uid = update.effective_user.id
     user_info = AUTHORIZED_USERS.get(uid, {})
     user_name = user_info.get("name", "Unknown")
     mem0_uid = user_name.lower()
+    chat_id = update.effective_chat.id
     logger.info(f"Message from {user_name}: {user_message[:100]}")
 
-    # Send typing action
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    await update.message.reply_text("🧠 On it...")
+    lock = _get_chat_lock(chat_id)
 
-    # Recall relevant memories from Mem0
-    loop = asyncio.get_event_loop()
-    memories = await loop.run_in_executor(None, mem0_recall, user_message, mem0_uid)
+    # If Miya is busy processing, queue the message but don't block
+    if lock.locked():
+        _chat_queues.setdefault(chat_id, []).append((user_name, mem0_uid, user_message))
+        count = len(_chat_queues[chat_id])
+        # Don't spam "queued" messages - they know she's working
+        if count <= 1:
+            await update.message.reply_text("📬 Got it — I'll get to this right after.")
+        return
 
-    # Prefix message with who's talking + any memories
-    prefixed = f"[Message from {user_name}]{memories}: {user_message}"
+    # Check if this is a phone control request - run as background subagent
+    if _is_phone_request(user_message):
+        status = phone_status()
+        if not status.get("connected"):
+            await update.message.reply_text("Phone's not connected rn. Make sure MIYA app is open.")
+            return
 
-    _chat_id = update.effective_chat.id
-    response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=_chat_id))
+        await update.message.reply_text(f"📱 On it — controlling phone in background. Keep chatting!")
+        loop = asyncio.get_event_loop()
 
-    # Store conversation in Mem0 (non-blocking)
-    loop.run_in_executor(None, mem0_store, user_message, response, mem0_uid)
+        # Run phone agent in background - doesn't hold any lock
+        async def _bg_phone():
+            try:
+                memories = await loop.run_in_executor(None, mem0_recall, user_message, mem0_uid)
+                task = f"[Phone control request from {user_name}]{memories}: {user_message}"
+                result = await loop.run_in_executor(None, run_phone_agent, task, chat_id)
+                loop.run_in_executor(None, mem0_store, user_message, result, mem0_uid)
+                # Send result back to Telegram
+                for chunk in split_message(f"📱 {result}"):
+                    _send_telegram_sync(chat_id, chunk)
+            except Exception as e:
+                _send_telegram_sync(chat_id, f"📱 Phone task failed: {e}")
 
-    await send_response(update, response)
-    logger.info(f"Response sent to {user_name} ({len(response)} chars)")
+        asyncio.create_task(_bg_phone())
+        return
+
+    async with lock:
+        # Send typing action
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        await update.message.reply_text("🧠 On it...")
+
+        # Recall relevant memories from Mem0
+        loop = asyncio.get_event_loop()
+        memories = await loop.run_in_executor(None, mem0_recall, user_message, mem0_uid)
+
+        # Prefix message with who's talking + any memories
+        prefixed = f"[Message from {user_name}]{memories}: {user_message}"
+
+        response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=chat_id))
+
+        # Store conversation in Mem0 (non-blocking)
+        loop.run_in_executor(None, mem0_store, user_message, response, mem0_uid)
+
+        await send_response(update, response)
+        logger.info(f"Response sent to {user_name} ({len(response)} chars)")
+
+        # Drain queued messages — combine and send as one follow-up
+        while _chat_queues.get(chat_id):
+            queued = _chat_queues.pop(chat_id, [])
+            combined_texts = [msg for _, _, msg in queued]
+            combined = "\n".join(combined_texts)
+            q_user = queued[0][0]  # user_name from first queued msg
+            q_mem0 = queued[0][1]  # mem0_uid from first queued msg
+            logger.info(f"Processing {len(queued)} queued messages from {q_user}")
+
+            memories = await loop.run_in_executor(None, mem0_recall, combined, q_mem0)
+            prefixed = f"[Follow-up from {q_user} — {len(queued)} messages sent while you were working]{memories}: {combined}"
+
+            response = await loop.run_in_executor(None, lambda: run_claude(prefixed, chat_id=chat_id))
+            loop.run_in_executor(None, mem0_store, combined, response, q_mem0)
+            await send_response(update, response)
 
 
 # ============================================================
@@ -1405,7 +1821,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     logger.info("Starting Telegram bot v2...")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1419,6 +1835,7 @@ def main():
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("current", cmd_current))
     app.add_handler(CommandHandler("restart", cmd_restart))
+    app.add_handler(CommandHandler("steer", cmd_steer))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("train", cmd_train))
     app.add_handler(CommandHandler("pnl", cmd_pnl))
@@ -1430,6 +1847,7 @@ def main():
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("unpause", cmd_unpause))
     app.add_handler(CommandHandler("services", cmd_services))
+    app.add_handler(CommandHandler("phone", cmd_phone))
     app.add_handler(CommandHandler("memory", cmd_memory))
 
     # Callbacks (inline buttons)

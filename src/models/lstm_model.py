@@ -457,16 +457,22 @@ class LSTMPredictor:
 
         # Get feature columns
         available_cols = [f for f in self.feature_names if f in features_df.columns]
-        if len(available_cols) < len(self.feature_names) * 0.8:
+        missing_cols = [f for f in self.feature_names if f not in features_df.columns]
+        if missing_cols:
             logger.warning(f"LSTM: Only {len(available_cols)}/{len(self.feature_names)} features available")
+            logger.warning(f"Missing {len(missing_cols)} features, using training means as neutral defaults")
 
         # Prepare full feature matrix with correct columns
+        # Use training mean for missing features so they normalize to 0 (neutral)
+        # instead of zeros which create phantom bearish/bullish signals
         cols_data = {}
-        for col in self.feature_names:
+        for i, col in enumerate(self.feature_names):
             if col in features_df.columns:
                 cols_data[col] = features_df[col].values
             else:
-                cols_data[col] = np.zeros(len(features_df))
+                # Use training mean so (mean - mean) / std = 0 after normalization
+                default_val = self.feature_mean[i] if self.feature_mean is not None else 0.0
+                cols_data[col] = np.full(len(features_df), default_val)
         X = pd.DataFrame(cols_data, index=features_df.index)
 
         features = X.values.astype(np.float32)

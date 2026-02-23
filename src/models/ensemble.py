@@ -223,15 +223,24 @@ class MetaLearnerEnsemble:
         self.lstm_model = lstm_model
         self.min_confidence = min_confidence
 
-        # Equal model weights — all 3 retrained with balanced data
-        self.xgb_weight = 0.35
-        self.rl_weight = 0.30
-        self.lstm_weight = 0.35
+        # V3: LSTM still never votes BUY in live despite balanced training
+        # Reduce LSTM weight, boost XGB+RL so they can drive decisions
+        self.xgb_weight = 0.45
+        self.rl_weight = 0.25
+        self.lstm_weight = 0.30
 
         # Meta-learner
         self.meta_model = None
         self.outcome_buffer = []  # List of (meta_features, outcome)
         self._load_meta_learner()
+
+    def set_weights(self, weights: Dict[str, float]):
+        """Dynamically update model weights from EnsembleEvaluator."""
+        old = {"xgb": self.xgb_weight, "rl": self.rl_weight, "lstm": self.lstm_weight}
+        self.xgb_weight = weights.get("xgb", self.xgb_weight)
+        self.rl_weight = weights.get("rl", self.rl_weight)
+        self.lstm_weight = weights.get("lstm", self.lstm_weight)
+        logger.info(f"Ensemble weights updated: {old} → {weights}")
 
     def get_decision(
         self,
@@ -366,7 +375,7 @@ class MetaLearnerEnsemble:
         # XGB + RL agree but LSTM dissents (common for BUY since LSTM has SELL bias)
         # Allow if both have decent confidence (>0.55)
         if xgb_action == rl_action and xgb_action != Action.HOLD:
-            if xgb_conf > 0.55 and rl_conf > 0.55:
+            if xgb_conf > 0.45 and rl_conf > 0.45:
                 action_type = xgb_action
                 label = "BUY" if action_type == Action.BUY else "SELL"
                 # Use XGB+RL weighted confidence with slight penalty for missing LSTM
@@ -485,14 +494,16 @@ class MetaLearnerEnsemble:
 
     @staticmethod
     def _calculate_position_size(confidence: float) -> float:
+        # Normalized sizing: target $5-$8 margin on ~$25 account
+        # Maps to 20-32% of balance
         if confidence >= 0.75:
-            return 20.0
+            return 32.0   # ~$8 on $25
         elif confidence >= 0.65:
-            return 15.0
+            return 28.0   # ~$7 on $25
         elif confidence >= 0.55:
-            return 10.0
+            return 24.0   # ~$6 on $25
         else:
-            return 5.0
+            return 20.0   # ~$5 on $25
 
     def get_stats(self):
         return {
